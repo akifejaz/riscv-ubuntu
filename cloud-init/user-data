@@ -1,0 +1,59 @@
+#cloud-config
+# Basic system configuration
+hostname: riscv-ubuntu
+fqdn: riscv-ubuntu.local
+manage_etc_hosts: true
+timezone: UTC
+
+# User configuration
+users:
+  - name: ubuntu
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    groups: sudo
+    lock_passwd: false
+    # Default password is 'ubuntu'
+    plain_text_passwd: "ubuntu"
+    #passwd: $6$rounds=4096$aQ7UEYIO$c/3UOJYPAaZzGkM5gGnFcUV2GQiLk0RwYYU4H5Y8z7N8p6XKnZgBWQvyLPhqLqGbEqZdMuEkGf3ZkMQdM7S0i.
+    ssh_authorized_keys: []
+
+# Ensure the default password is set and not forced to change
+chpasswd:
+  expire: false
+
+# Package management
+package_update: false
+package_upgrade: false
+
+# Essential packages
+packages:
+  - openssh-server
+
+# # SSH configuration
+# ssh_pwauth: true
+# ssh_deletekeys: false
+# ssh_genkeytypes: [rsa, ecdsa, ed25519]
+
+# # Configure SSH and create marker files
+runcmd:
+  - mkdir -p /etc/systemd/system/serial-getty@ttyS0.service.d
+  - |
+    cat >/etc/systemd/system/serial-getty@ttyS0.service.d/override.conf <<'EOF'
+    [Service]
+    ExecStart=
+    ExecStart=-/sbin/agetty --autologin ubuntu --noclear %I 115200 linux
+    EOF
+  - systemctl daemon-reload
+  - systemctl enable serial-getty@ttyS0.service
+  - systemctl restart serial-getty@ttyS0.service
+
+# Network configuration
+network:
+  config: disabled  # Let systemd-networkd handle it
+
+# Final message  
+final_message: |
+  Cloud-init finished at $TIMESTAMP
+  Uptime: $UPTIME
+  RISC-V Ubuntu image is ready.
+  Default user: ubuntu / password: ubuntu

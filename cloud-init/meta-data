@@ -1,0 +1,3 @@
+instance-id: riscv-ubuntu-003
+local-hostname: riscv-ubuntu
+platform: qemu-riscv64
