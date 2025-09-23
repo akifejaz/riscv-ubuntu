@@ -35,56 +35,56 @@ jobs:
         run: |
           set -euo pipefail
 
-          # 1) Keep checking container liveness + boot markers
-          echo "Waiting for boot markers..."
-          for i in $(seq 1 150); do
-            # container died?
+          echo "Waiting for container to stay alive and QEMU to start..."
+          # Wait for container + qemu pid to appear
+          for i in $(seq 1 180); do
             if ! docker ps --format '{{.Names}}' | grep -q '^riscv-test$'; then
-              echo "Container is not running. Recent logs:"
-              docker logs riscv-test || true
-              exit 1
+              echo "Container exited early. Recent logs:"; docker logs riscv-test || true; exit 1
             fi
-            # saw boot marker?
-            if docker exec riscv-test sh -lc \
-              "grep -E 'RISC-V Ubuntu image is ready|cloud-init.*finished|Ubuntu .+ ttyS0' /var/log/qemu/qemu.boot.log >/dev/null 2>&1"; then
-              echo "Boot marker found."
+            QPID=$(docker exec riscv-test sh -lc 'pgrep -x qemu-system-riscv64 | head -n1' || true)
+            if [ -n "${QPID:-}" ]; then
               break
             fi
-            sleep 4
+            sleep 3
           done
+          if [ -z "${QPID:-}" ]; then
+            echo "ERROR: QEMU process not found."; docker logs riscv-test || true; exit 1
+          fi
+          echo "QEMU PID: $QPID"
 
-          # 2) Try to read PTY from boot.log (fast path)
-          PTY=$(docker exec riscv-test sh -lc "awk '/Guest serial PTY: \\/dev\\/pts\\//{print \$NF}' /var/log/qemu/qemu.boot.log | tail -n1" || true)
+          # Primary: find a /dev/pts/N that QEMU holds open (serial pty)
+          PTY=$(docker exec riscv-test sh -lc \
+            'ls -l /proc/'"$QPID"'/fd 2>/dev/null | awk "/pts\\/[0-9]+/ {print \$NF}" | tail -n1' || true)
           if [ -n "$PTY" ]; then
             echo "GUEST_PTY=$PTY" | tee -a $GITHUB_ENV
-            echo "Discovered PTY from log: $PTY"
+            echo "Found PTY via /proc: $PTY"
             exit 0
           fi
 
-          # 3) Fallback: ask the QEMU monitor (HMP) for chardev info
-          #    Your entrypoint starts QEMU with: -monitor unix:${MON_SOCK},server,nowait
-          #    Try common socket paths if you didn't export MON_SOCK; adjust if yours differs.
+          # Fallback 1: parse from boot log announcement
+          PTY=$(docker exec riscv-test sh -lc \
+            "awk '/Guest serial PTY: \\/dev\\/pts\\//{print \\$NF}' /var/log/qemu/qemu.boot.log | tail -n1" || true)
+          if [ -n "$PTY" ]; then
+            echo "GUEST_PTY=$PTY" | tee -a $GITHUB_ENV
+            echo "Found PTY via boot log: $PTY"
+            exit 0
+          fi
+
+          # Fallback 2: query HMP monitor if available
           for sock in /tmp/qemu-monitor.sock /var/run/qemu-monitor.sock /var/run/qemu/monitor.sock; do
             if docker exec riscv-test sh -lc "[ -S $sock ]"; then
               echo "Querying monitor at $sock ..."
-              PTY=$(docker exec riscv-test sh -lc "printf 'info chardev\\n' | socat - UNIX-CONNECT:$sock | awk '/ttyS0|serial0|chardev/ && /backend/ && /path/ { for(i=1;i<=NF;i++){ if(\$i ~ /^path=/){ sub(/path=/,\"\"); gsub(/,/,\"\"); print \$i } } }' | tail -n1" || true)
+              PTY=$(docker exec riscv-test sh -lc \
+                "printf 'info chardev\n' | socat - UNIX-CONNECT:$sock | awk '/ttyS0|serial0|chardev/ && /path=/ { for(i=1;i<=NF;i++){ if(\$i ~ /^path=/){ sub(/path=/,\"\"); gsub(/,/,\"\"); print \$i } } }' | tail -n1" || true)
               if [ -n "$PTY" ]; then
                 echo "GUEST_PTY=$PTY" | tee -a $GITHUB_ENV
-                echo "Discovered PTY from monitor: $PTY"
+                echo "Found PTY via monitor: $PTY"
                 exit 0
               fi
             fi
           done
 
-          # 4) Last resort: locate the PTY by following QEMU's file descriptors
-          PTY=$(docker exec riscv-test sh -lc "pid=\$(pgrep -x qemu-system-riscv64 | head -n1); test -n \"\$pid\" || exit 0; ls -l /proc/\$pid/fd 2>/dev/null | awk '/pts\\/[0-9]+/ {print \$NF}' | tail -n1" || true)
-          if [ -n "$PTY" ]; then
-            echo "GUEST_PTY=$PTY" | tee -a $GITHUB_ENV
-            echo "Discovered PTY from /proc: $PTY"
-            exit 0
-          fi
-
-          echo 'ERROR: Could not discover guest serial PTY.'
+          echo "ERROR: Could not discover guest serial PTY."
           docker exec riscv-test sh -lc 'tail -n +1 /var/log/qemu/qemu.boot.log || true' || true
           exit 1
 
@@ -93,11 +93,12 @@ jobs:
           set -euo pipefail
           echo "Using PTY: $GUEST_PTY"
 
-          # Helper to send a command to the guest serial (CRLF to simulate Enter)
+          # Helper: send one line to guest console
           send() { docker exec riscv-test sh -lc "printf '%s\r\n' \"$*\" > $GUEST_PTY"; }
 
-          # If your image autologins 'ubuntu', no login needed. Otherwise, uncomment:
-          # send "ubuntu"; send "ubuntu"   # username & password
+          # Nudge the console (ensures getty has focus)
+          send ""
+          sleep 2
 
           send "echo '=== /etc/os-release ===' && cat /etc/os-release"
           send "echo '=== uname -a ===' && uname -a"
@@ -108,13 +109,13 @@ jobs:
           send "echo '=== network ===' && ip a && ip route && (resolvectl status | sed -n '1,80p' || true)"
           send "echo '=== apt-get update ===' && sudo apt-get update -y || sudo apt-get update -y"
 
-          # Give guest time to print output
-          sleep 15
+          # Give console time to flush
+          sleep 20
 
           echo "----- Console tail (guest serial) -----"
-          docker exec riscv-test sh -lc "tail -n 400 $GUEST_PTY || true" || true
+          docker exec riscv-test sh -lc "tail -n 500 $GUEST_PTY || true" || true
           echo "----- QEMU boot log tail -----"
-          docker exec riscv-test sh -lc "tail -n 200 /var/log/qemu/qemu.boot.log || true"
+          docker exec riscv-test sh -lc "tail -n 300 /var/log/qemu/qemu.boot.log || true" || true
 
           echo "Image ID: $IMAGE_ID"
           echo "Repo Digest: $REPO_DIGEST"
