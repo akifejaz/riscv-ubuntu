@@ -1,5 +1,4 @@
 # Makefile for RISC-V QEMU Docker Environment
-# Provides convenient commands for building, testing, and managing the Docker image
 
 # Configuration
 DOCKER_IMAGE ?= riscv-qemu-ubuntu
@@ -68,23 +67,6 @@ build-no-cache: check-deps ## Build the Docker image without cache
 		.
 	@echo "$(GREEN)Build completed successfully$(NC)"
 
-## Run quick tests
-test-quick: ## Run quick tests (no VM boot)
-	@echo "$(GREEN)Running quick tests...$(NC)"
-	@./examples/local-test.sh --skip-build --quick-test
-
-## Run full test suite
-test: ## Run full test suite
-	@echo "$(GREEN)Running full test suite...$(NC)"
-	@./examples/local-test.sh --skip-build --full-test
-
-## Run performance tests
-test-performance: ## Run performance benchmarks
-	@echo "$(GREEN)Running performance tests...$(NC)"
-	@./examples/local-test.sh --skip-build --performance-test
-
-## Build and test
-build-and-test: build test ## Build image and run tests
 
 ## Clean up containers and images
 clean: ## Clean up test containers and images
@@ -150,22 +132,6 @@ logs: ## View container logs
 	@echo "$(GREEN)Showing container logs...$(NC)"
 	docker logs -f $(TEST_CONTAINER_NAME)
 
-## Stop running container
-stop: ## Stop running container
-	@echo "$(YELLOW)Stopping container: $(TEST_CONTAINER_NAME)$(NC)"
-	-docker stop $(TEST_CONTAINER_NAME)
-	@echo "$(GREEN)Container stopped$(NC)"
-
-## Check container health
-health: ## Check container health status
-	@echo "$(GREEN)Checking container health...$(NC)"
-	@if docker ps --filter name=$(TEST_CONTAINER_NAME) --format "table {{.Names}}\t{{.Status}}" | grep -q $(TEST_CONTAINER_NAME); then \
-		echo "Container is running"; \
-		docker exec $(TEST_CONTAINER_NAME) /opt/scripts/health-check.sh; \
-	else \
-		echo "$(RED)Container $(TEST_CONTAINER_NAME) is not running$(NC)"; \
-		exit 1; \
-	fi
 
 ## Show image information
 info: ## Show image information and size
@@ -175,33 +141,6 @@ info: ## Show image information and size
 	@echo "$(GREEN)Image layers:$(NC)"
 	@docker history $(DOCKER_IMAGE):$(DOCKER_TAG) --format "table {{.CreatedBy}}\t{{.Size}}" --no-trunc
 
-## Start with docker-compose
-compose-up: ## Start services with docker-compose
-	@echo "$(GREEN)Starting services with docker-compose...$(NC)"
-	docker-compose up -d
-	@echo "$(GREEN)Services started$(NC)"
-
-## Stop docker-compose services
-compose-down: ## Stop docker-compose services
-	@echo "$(YELLOW)Stopping docker-compose services...$(NC)"
-	docker-compose down
-	@echo "$(GREEN)Services stopped$(NC)"
-
-## View docker-compose logs
-compose-logs: ## View docker-compose logs
-	@echo "$(GREEN)Showing docker-compose logs...$(NC)"
-	docker-compose logs -f
-
-## Run CI tests
-ci-test: ## Run tests suitable for CI environment
-	@echo "$(GREEN)Running CI tests...$(NC)"
-	docker run --rm \
-		--privileged \
-		-e RISCV_MEMORY=2G \
-		-e RISCV_CPUS=1 \
-		-e BOOT_TIMEOUT=180 \
-		$(DOCKER_IMAGE):$(DOCKER_TAG) \
-		test system network
 
 ## Security scan with Trivy
 security-scan: ## Run security scan on the image
@@ -213,20 +152,6 @@ security-scan: ## Run security scan on the image
 		docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
 			aquasec/trivy:latest image --exit-code 0 --no-progress --format table $(DOCKER_IMAGE):$(DOCKER_TAG); \
 	fi
-
-## Check dependencies
-check-deps: ## Check required dependencies
-	@echo "$(GREEN)Checking dependencies...$(NC)"
-	@command -v docker >/dev/null 2>&1 || { echo "$(RED)Docker is required but not installed$(NC)"; exit 1; }
-	@docker info >/dev/null 2>&1 || { echo "$(RED)Cannot connect to Docker daemon$(NC)"; exit 1; }
-	@echo "$(GREEN)Dependencies OK$(NC)"
-
-## Development setup
-dev-setup: ## Set up development environment
-	@echo "$(GREEN)Setting up development environment...$(NC)"
-	@mkdir -p $(TEST_RESULTS_DIR) $(LOG_DIR)
-	@chmod +x scripts/*.sh examples/*.sh
-	@echo "$(GREEN)Development environment ready$(NC)"
 
 ## Lint Dockerfiles
 lint: ## Lint Dockerfile and scripts
@@ -242,16 +167,6 @@ lint: ## Lint Dockerfile and scripts
 		echo "$(YELLOW)shellcheck not installed, skipping shell script linting$(NC)"; \
 	fi
 
-## Show resource usage
-stats: ## Show container resource usage
-	@echo "$(GREEN)Container resource usage:$(NC)"
-	@docker stats $(TEST_CONTAINER_NAME) --no-stream 2>/dev/null || echo "Container not running"
-
-## Export image
-export: ## Export image to tar file
-	@echo "$(GREEN)Exporting image to tar file...$(NC)"
-	docker save $(DOCKER_IMAGE):$(DOCKER_TAG) | gzip > $(DOCKER_IMAGE)-$(DOCKER_TAG).tar.gz
-	@echo "$(GREEN)Image exported to $(DOCKER_IMAGE)-$(DOCKER_TAG).tar.gz$(NC)"
 
 ## Import image
 import: ## Import image from tar file
