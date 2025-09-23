@@ -20,29 +20,37 @@ jobs:
           echo "  ID: $(docker inspect --format='{{.Id}}' cloudv10x/riscv-qemu-ubuntu:latest)"
           echo "  Digest: $(docker inspect --format='{{index .RepoDigests 0}}' cloudv10x/riscv-qemu-ubuntu:latest)"
 
-      - name: Start container (QEMU + user-net)
+      - name: Start container 
         run: |
           set -euo pipefail
-          # host networking to reduce DNS hiccups in CI
-          docker run -d --name riscv-test --network host \
+          # -d -t gives the entrypoint a TTY so 'socat ... </dev/stdin' can attach safely
+          # AUTO_ATTACH=0 is a hint to your script to not steal the console (ignored if unsupported)
+          docker run -d -t --name riscv-test --network host \
+            -e AUTO_ATTACH=0 \
             cloudv10x/riscv-qemu-ubuntu:latest
           docker ps
 
-      - name: Wait for boot-ready and discover serial PTY
+      - name: Wait for boot-ready and discover guest serial PTY
         timeout-minutes: 10
         run: |
           set -euo pipefail
-          # Wait until your entrypoint writes the boot-ready line
-          echo "Waiting for boot-ready marker in /var/log/qemu/qemu.boot.log ..."
-          for i in $(seq 1 120); do
-            if docker exec riscv-test sh -lc "grep -E 'RISC-V Ubuntu image is ready|cloud-init.*finished|Ubuntu .+ ttyS0' /var/log/qemu/qemu.boot.log >/dev/null 2>&1"; then
-              echo "Boot-ready marker found."
+
+          # Bail out early if the container dies
+          for i in $(seq 1 60); do
+            if ! docker ps --format '{{.Names}}' | grep -q '^riscv-test$'; then
+              echo "Container is not running. Recent logs:"
+              docker logs riscv-test || true
+              exit 1
+            fi
+            # Look for either PTY announcement or boot-ready markers
+            if docker exec riscv-test sh -lc \
+              "grep -E 'Guest serial PTY: /dev/pts/|RISC-V Ubuntu image is ready|cloud-init.*finished|Ubuntu .+ ttyS0' /var/log/qemu/qemu.boot.log >/dev/null 2>&1"; then
               break
             fi
             sleep 5
           done
 
-          # Discover the guest serial PTY from the log line printed by your entrypoint
+          # Resolve PTY path from log
           PTY=$(docker exec riscv-test sh -lc "awk '/Guest serial PTY: \\/dev\\/pts\\//{print \$NF}' /var/log/qemu/qemu.boot.log | tail -n1")
           if [ -z "$PTY" ]; then
             echo "ERROR: Could not discover guest serial PTY."
@@ -57,34 +65,29 @@ jobs:
           set -euo pipefail
           echo "Using PTY: $GUEST_PTY"
 
-          # Helper to write a command (with newline) into the guest TTY
+          # Helper to send a command to the guest serial (CRLF to simulate Enter)
           send() { docker exec riscv-test sh -lc "printf '%s\r\n' \"$*\" > $GUEST_PTY"; }
 
-          # If your image autologins 'ubuntu', this is not needed; otherwise uncomment:
-          # send 'ubuntu'; send 'ubuntu'   # username & password
+          # If your image autologins 'ubuntu', no login needed. Otherwise, uncomment:
+          # send "ubuntu"; send "ubuntu"   # username & password
 
-          # Run sanity commands in the guest
           send "echo '=== /etc/os-release ===' && cat /etc/os-release"
           send "echo '=== uname -a ===' && uname -a"
           send "echo '=== lscpu ===' && lscpu || true"
-          send "echo '=== cpuinfo ===' && cat /proc/cpuinfo | sed -n '1,120p' || true"
+          send "echo '=== cpuinfo ===' && sed -n '1,120p' /proc/cpuinfo || true"
           send "echo '=== memory ===' && free -h"
           send "echo '=== disk ===' && df -h"
-          send "echo '=== network ===' && ip a && ip route && resolvectl status | sed -n '1,80p' || true"
-
-          # Verify outbound networking (apt-get update)
+          send "echo '=== network ===' && ip a && ip route && (resolvectl status | sed -n '1,80p' || true)"
           send "echo '=== apt-get update ===' && sudo apt-get update -y || sudo apt-get update -y"
 
-          # Give the guest a few seconds to print results
+          # Give guest time to print output
           sleep 15
 
-          # Show the latest console output
           echo "----- Console tail (guest serial) -----"
           docker exec riscv-test sh -lc "tail -n 400 $GUEST_PTY || true" || true
           echo "----- QEMU boot log tail -----"
           docker exec riscv-test sh -lc "tail -n 200 /var/log/qemu/qemu.boot.log || true"
 
-          # Also echo image identifiers for the record
           echo "Image ID: $IMAGE_ID"
           echo "Repo Digest: $REPO_DIGEST"
 
