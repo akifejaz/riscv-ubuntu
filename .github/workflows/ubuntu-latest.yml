@@ -1,0 +1,56 @@
+name: RISC-V (riscv64) Ubuntu Smoke Test
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout (no repo files needed)
+        uses: actions/checkout@v4
+
+      - name: Enable QEMU (for riscv64 emulation)
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: riscv64
+
+      - name: Show Docker info
+        run: |
+          docker version
+          docker info
+
+      - name: Pull riscv64 Ubuntu:latest
+        run: |
+          docker pull --platform=linux/riscv64 ubuntu:latest
+
+      - name: Run basic checks inside riscv64 Ubuntu
+        run: |
+          docker run --rm --platform=linux/riscv64 ubuntu:latest bash -lc '
+            set -euxo pipefail
+
+            echo "== /etc/os-release =="
+            cat /etc/os-release || true
+
+            echo "== uname -a =="
+            uname -a
+
+            echo "== CPU info (lscpu) =="
+            lscpu || true
+
+            echo "== Kernel version =="
+            uname -r
+
+            echo "== APT update =="
+            apt-get update
+
+            echo "== Image details (filesystem + arch) =="
+            df -h /
+            dpkg --print-architecture || true
+
+            echo "== Extra: proc cpuinfo (emulated) =="
+            head -n 50 /proc/cpuinfo || true
+          '
