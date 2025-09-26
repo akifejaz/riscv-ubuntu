@@ -37,6 +37,7 @@ jobs:
           --privileged \
           -v ${{ github.workspace }}/workspace:/workspace \
           -v ${{ github.workspace }}/var/log/qemu:/var/log/qemu \
+          -e QEMU_OPTS="-virtfs local,path=/workspace,mount_tag=hostshare,security_model=none,multidevs=remap" \
           -e AUTO_ATTACH=0 \
           cloudv10x/riscv-qemu-ubuntu:latest)
         
@@ -142,8 +143,13 @@ jobs:
         # Ensure we have shell prompt (send Enter)
         echo "Ensuring shell prompt..."
         docker exec riscv-test sh -c "printf '\r\n' > $GUEST_PTY"
-        sleep 2
-        
+        sleep 20
+
+        send_cmd "sudo mkdir -p /workspace" "Ensure /workspace exists in guest"
+        send_cmd "sudo mount -t 9p -o trans=virtio,version=9p2000.L hostshare /workspace" "Mount /workspace via 9p"
+        send_cmd "mount | grep -E '^hostshare .* /workspace.* 9p'" "Verify 9p mount"
+
+
         # Send system information commands
         send_cmd "echo '=== System Information ==='" "Header"
         send_cmd "uname -a" "Kernel Information"
@@ -159,7 +165,7 @@ jobs:
         
         # Test workspace access
         send_cmd "ls -la /workspace" "Workspace Contents"
-        send_cmd "echo 'RISC-V Test Success' > /workspace/test_output.txt" "Workspace Write Test"
+        send_cmd "echo 'RISC-V Test Success' | tee /workspace/test_output.txt" "Workspace Write Test"
         send_cmd "cat /workspace/test_output.txt" "Workspace Read Test"
         
         # Give time for final outputs
