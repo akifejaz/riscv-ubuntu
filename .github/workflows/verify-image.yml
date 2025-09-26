@@ -1,127 +1,242 @@
-name: Verify RISC-V Docker Image
+name: RISC-V QEMU Ubuntu Test
 
 on:
-  workflow_dispatch:
   push:
+    branches: [ main, develop ]
+  pull_request:
     branches: [ main ]
+  workflow_dispatch:
 
 jobs:
-  verify:
+  test-riscv-qemu:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 25
+    
     steps:
-      - name: Pull latest image and show identifiers
-        run: |
-          set -euo pipefail
-          docker pull cloudv10x/riscv-qemu-ubuntu:latest
-          echo "IMAGE_ID=$(docker inspect --format='{{.Id}}' cloudv10x/riscv-qemu-ubuntu:latest)" >> $GITHUB_ENV
-          echo "REPO_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' cloudv10x/riscv-qemu-ubuntu:latest)" >> $GITHUB_ENV
-          echo "Pulled image:"
-          echo "  ID: $(docker inspect --format='{{.Id}}' cloudv10x/riscv-qemu-ubuntu:latest)"
-          echo "  Digest: $(docker inspect --format='{{index .RepoDigests 0}}' cloudv10x/riscv-qemu-ubuntu:latest)"
+    - name: Checkout repository
+      uses: actions/checkout@v4
 
-      - name: Start container 
-        run: |
-          set -euo pipefail
-          # -d -t gives the entrypoint a TTY so 'socat ... </dev/stdin' can attach safely
-          # AUTO_ATTACH=0 is a hint to your script to not steal the console (ignored if unsupported)
-          docker run -d -t --name riscv-test --network host \
-            -e AUTO_ATTACH=0 \
-            cloudv10x/riscv-qemu-ubuntu:latest
-          docker ps
+    - name: Create log directories and workspace
+      run: |
+        mkdir -p ${{ github.workspace }}/var/log/qemu
+        mkdir -p ${{ github.workspace }}/workspace
+        chmod 755 ${{ github.workspace }}/var/log/qemu
+        chmod 755 ${{ github.workspace }}/workspace
 
-      - name: Wait for boot-ready and discover guest serial PTY
-        timeout-minutes: 15
-        run: |
-          set -euo pipefail
+    - name: Pull RISC-V QEMU Ubuntu image
+      run: |
+        docker pull cloudv10x/riscv-qemu-ubuntu:latest
+        docker images cloudv10x/riscv-qemu-ubuntu:latest
 
-          echo "Waiting for container to stay alive and QEMU to start..."
-          # Wait for container + qemu pid to appear
-          for i in $(seq 1 180); do
-            if ! docker ps --format '{{.Names}}' | grep -q '^riscv-test$'; then
-              echo "Container exited early. Recent logs:"; docker logs riscv-test || true; exit 1
-            fi
-            QPID=$(docker exec riscv-test sh -lc 'pgrep -x qemu-system-riscv64 | head -n1' || true)
-            if [ -n "${QPID:-}" ]; then
-              break
-            fi
-            sleep 3
-          done
-          if [ -z "${QPID:-}" ]; then
-            echo "ERROR: QEMU process not found."; docker logs riscv-test || true; exit 1
+    - name: Start RISC-V QEMU container
+      id: start-container
+      run: |
+        # Start container in detached mode with TTY
+        CONTAINER_ID=$(docker run -d -t \
+          --name riscv-test \
+          --privileged \
+          -v ${{ github.workspace }}/workspace:/workspace \
+          -v ${{ github.workspace }}/var/log/qemu:/var/log/qemu \
+          -e AUTO_ATTACH=0 \
+          cloudv10x/riscv-qemu-ubuntu:latest)
+        
+        echo "container_id=$CONTAINER_ID" >> $GITHUB_OUTPUT
+        echo "Started container: $CONTAINER_ID"
+        
+        # Verify container is running
+        docker ps --filter "name=riscv-test"
+
+    - name: Wait for QEMU boot and discover guest PTY
+      timeout-minutes: 12
+      run: |
+        echo "Waiting for QEMU to boot and discovering guest serial PTY..."
+        
+        # Wait for QEMU process to start
+        echo "Waiting for QEMU process..."
+        for i in $(seq 1 120); do
+          if ! docker ps --format '{{.Names}}' | grep -q '^riscv-test$'; then
+            echo "Container exited early!"
+            docker logs riscv-test || true
+            exit 1
           fi
-          echo "QEMU PID: $QPID"
-
-          # Primary: find a /dev/pts/N that QEMU holds open (serial pty)
-          PTY=$(docker exec riscv-test sh -lc \
-            'ls -l /proc/'"$QPID"'/fd 2>/dev/null | awk "/pts\\/[0-9]+/ {print \$NF}" | tail -n1' || true)
-          if [ -n "$PTY" ]; then
-            echo "GUEST_PTY=$PTY" | tee -a $GITHUB_ENV
-            echo "Found PTY via /proc: $PTY"
-            exit 0
+          
+          QEMU_PID=$(docker exec riscv-test sh -c 'pgrep -x qemu-system-riscv64 | head -n1' 2>/dev/null || true)
+          if [ -n "${QEMU_PID:-}" ]; then
+            echo "QEMU process found with PID: $QEMU_PID"
+            break
           fi
-
-          # Fallback 1: parse from boot log announcement
-          PTY=$(docker exec riscv-test sh -lc \
-            "awk '/Guest serial PTY: \\/dev\\/pts\\//{print \\$NF}' /var/log/qemu/qemu.boot.log | tail -n1" || true)
-          if [ -n "$PTY" ]; then
-            echo "GUEST_PTY=$PTY" | tee -a $GITHUB_ENV
-            echo "Found PTY via boot log: $PTY"
-            exit 0
-          fi
-
-          # Fallback 2: query HMP monitor if available
-          for sock in /tmp/qemu-monitor.sock /var/run/qemu-monitor.sock /var/run/qemu/monitor.sock; do
-            if docker exec riscv-test sh -lc "[ -S $sock ]"; then
-              echo "Querying monitor at $sock ..."
-              PTY=$(docker exec riscv-test sh -lc \
-                "printf 'info chardev\n' | socat - UNIX-CONNECT:$sock | awk '/ttyS0|serial0|chardev/ && /path=/ { for(i=1;i<=NF;i++){ if(\$i ~ /^path=/){ sub(/path=/,\"\"); gsub(/,/,\"\"); print \$i } } }' | tail -n1" || true)
-              if [ -n "$PTY" ]; then
-                echo "GUEST_PTY=$PTY" | tee -a $GITHUB_ENV
-                echo "Found PTY via monitor: $PTY"
-                exit 0
-              fi
-            fi
-          done
-
-          echo "ERROR: Could not discover guest serial PTY."
-          docker exec riscv-test sh -lc 'tail -n +1 /var/log/qemu/qemu.boot.log || true' || true
-          exit 1
-
-      - name: Run basic checks INSIDE the guest via serial PTY
-        run: |
-          set -euo pipefail
-          echo "Using PTY: $GUEST_PTY"
-
-          # Helper: send one line to guest console
-          send() { docker exec riscv-test sh -lc "printf '%s\r\n' \"$*\" > $GUEST_PTY"; }
-
-          # Nudge the console (ensures getty has focus)
-          send ""
-          sleep 2
-
-          send "echo '=== /etc/os-release ===' && cat /etc/os-release"
-          send "echo '=== uname -a ===' && uname -a"
-          send "echo '=== lscpu ===' && lscpu || true"
-          send "echo '=== cpuinfo ===' && sed -n '1,120p' /proc/cpuinfo || true"
-          send "echo '=== memory ===' && free -h"
-          send "echo '=== disk ===' && df -h"
-          send "echo '=== network ===' && ip a && ip route && (resolvectl status | sed -n '1,80p' || true)"
-          send "echo '=== apt-get update ===' && sudo apt-get update -y || sudo apt-get update -y"
-
-          # Give console time to flush
-          sleep 20
-
-          echo "----- Console tail (guest serial) -----"
-          docker exec riscv-test sh -lc "tail -n 500 $GUEST_PTY || true" || true
-          echo "----- QEMU boot log tail -----"
-          docker exec riscv-test sh -lc "tail -n 300 /var/log/qemu/qemu.boot.log || true" || true
-
-          echo "Image ID: $IMAGE_ID"
-          echo "Repo Digest: $REPO_DIGEST"
-
-      - name: Cleanup
-        if: always()
-        run: |
+          
+          echo "Attempt $i/120 - QEMU not ready yet..."
+          sleep 3
+        done
+        
+        if [ -z "${QEMU_PID:-}" ]; then
+          echo "ERROR: QEMU process not found after timeout"
           docker logs riscv-test || true
-          docker rm -f riscv-test || true
+          exit 1
+        fi
+        
+        # Discover guest serial PTY
+        echo "Discovering guest serial PTY..."
+        
+        # Method 1: Check QEMU process file descriptors for PTY
+        PTY=$(docker exec riscv-test sh -c \
+          "ls -l /proc/$QEMU_PID/fd 2>/dev/null | grep 'pts/' | awk '{print \$NF}' | tail -n1" || true)
+        
+        if [ -n "$PTY" ] && docker exec riscv-test sh -c "[ -c '$PTY' ]"; then
+          echo "GUEST_PTY=$PTY" >> $GITHUB_ENV
+          echo "Found PTY via /proc: $PTY"
+        else
+          # Method 2: Parse from boot log
+          echo "Trying to find PTY from boot log..."
+          sleep 5
+          PTY=$(docker exec riscv-test sh -c \
+            "grep -oE 'char device redirected to (/dev/pts/[0-9]+)' /var/log/qemu/qemu.boot.log 2>/dev/null | awk '{print \$5}' | tail -n1" || true)
+          
+          if [ -n "$PTY" ] && docker exec riscv-test sh -c "[ -c '$PTY' ]"; then
+            echo "GUEST_PTY=$PTY" >> $GITHUB_ENV
+            echo "Found PTY via boot log: $PTY"
+          else
+            echo "ERROR: Could not discover guest serial PTY"
+            echo "=== Boot Log ==="
+            docker exec riscv-test cat /var/log/qemu/qemu.boot.log || true
+            exit 1
+          fi
+        fi
+        
+        # Wait for boot completion indicators
+        echo "Waiting for Ubuntu boot completion..."
+        for i in $(seq 1 180); do
+          # Check for boot ready messages
+          if docker exec riscv-test sh -c \
+            "grep -qE 'RISC-V Ubuntu image is ready|Ubuntu.*ttyS0|cloud-init.*finished|login:' /var/log/qemu/console.log 2>/dev/null"; then
+            echo "Boot completion detected!"
+            break
+          fi
+          
+          if [ $i -eq 180 ]; then
+            echo "Boot completion timeout - continuing anyway..."
+          fi
+          
+          sleep 2
+        done
+
+    - name: Test guest system via serial console
+      timeout-minutes: 8
+      run: |
+        echo "Testing guest system via PTY: $GUEST_PTY"
+        
+        # Helper function to send commands to guest
+        send_cmd() {
+          local cmd="$1"
+          local desc="$2"
+          echo "--- $desc ---"
+          # Send command and wait for output
+          docker exec riscv-test sh -c "printf '%s\r\n' '$cmd' > $GUEST_PTY"
+          sleep 3
+          # Read recent console output
+          docker exec riscv-test sh -c "timeout 5 cat $GUEST_PTY" 2>/dev/null || true
+          echo
+        }
+        
+        # Ensure we have shell prompt (send Enter)
+        echo "Ensuring shell prompt..."
+        docker exec riscv-test sh -c "printf '\r\n' > $GUEST_PTY"
+        sleep 2
+        
+        # Send system information commands
+        send_cmd "echo '=== System Information ==='" "Header"
+        send_cmd "uname -a" "Kernel Information"
+        send_cmd "lscpu" "CPU Information"
+        send_cmd "free -h" "Memory Information"
+        send_cmd "nproc" "CPU Core Count"
+        send_cmd "cat /proc/meminfo | head -10" "Detailed Memory"
+        send_cmd "df -h /" "Disk Usage"
+        send_cmd "uptime" "System Uptime"
+        send_cmd "cat /etc/os-release | head -5" "OS Release"
+        send_cmd "whoami" "Current User"
+        send_cmd "pwd" "Working Directory"
+        
+        # Test workspace access
+        send_cmd "ls -la /workspace" "Workspace Contents"
+        send_cmd "echo 'RISC-V Test Success' > /workspace/test_output.txt" "Workspace Write Test"
+        send_cmd "cat /workspace/test_output.txt" "Workspace Read Test"
+        
+        # Give time for final outputs
+        sleep 3
+
+    - name: Capture final console output
+      if: always()
+      run: |
+        echo "=== Final Console Output ==="
+        if [ -n "${GUEST_PTY:-}" ]; then
+          docker exec riscv-test sh -c "timeout 10 cat $GUEST_PTY" 2>/dev/null || true
+        fi
+
+    - name: Display logs and diagnostics
+      if: always()
+      run: |
+        echo "=== Container Status ==="
+        docker ps -a --filter "name=riscv-test"
+        
+        echo "=== Mounted Log Directory ==="
+        ls -la ${{ github.workspace }}/var/log/qemu/ || echo "Log directory not found"
+        
+        echo "=== QEMU Boot Log (last 50 lines) ==="
+        if [ -f "${{ github.workspace }}/var/log/qemu/qemu.boot.log" ]; then
+          tail -n 50 "${{ github.workspace }}/var/log/qemu/qemu.boot.log"
+        else
+          echo "Boot log not found in mounted directory, checking container..."
+          docker exec riscv-test tail -n 50 /var/log/qemu/qemu.boot.log 2>/dev/null || echo "Boot log not accessible"
+        fi
+        
+        echo "=== Console Log (last 50 lines) ==="
+        if [ -f "${{ github.workspace }}/var/log/qemu/console.log" ]; then
+          tail -n 50 "${{ github.workspace }}/var/log/qemu/console.log"
+        else
+          echo "Console log not found in mounted directory, checking container..."
+          docker exec riscv-test tail -n 50 /var/log/qemu/console.log 2>/dev/null || echo "Console log not accessible"
+        fi
+        
+        echo "=== Container Logs (last 100 lines) ==="
+        docker logs --tail 100 riscv-test 2>&1 || echo "Could not get container logs"
+        
+        echo "=== Workspace Test File ==="
+        cat ${{ github.workspace }}/workspace/test_output.txt 2>/dev/null || echo "Test output file not found"
+
+    - name: Detailed failure diagnostics
+      if: failure()
+      run: |
+        echo "=== FAILURE DIAGNOSTICS ==="
+        
+        echo "=== Full Container Logs ==="
+        docker logs riscv-test 2>&1 || true
+        
+        echo "=== Full Boot Log ==="
+        docker exec riscv-test cat /var/log/qemu/qemu.boot.log 2>/dev/null || true
+        
+        echo "=== Full Console Log ==="  
+        docker exec riscv-test cat /var/log/qemu/console.log 2>/dev/null || true
+        
+        echo "=== Container Processes ==="
+        docker exec riscv-test ps aux 2>/dev/null || true
+        
+        echo "=== Container File System ==="
+        docker exec riscv-test ls -la /opt/riscv-vm/ 2>/dev/null || true
+        docker exec riscv-test ls -la /var/log/qemu/ 2>/dev/null || true
+
+    - name: Upload logs and artifacts
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: riscv-qemu-logs
+        path: |
+          ${{ github.workspace }}/var/log/qemu/
+          ${{ github.workspace }}/workspace/
+        retention-days: 7
+
+    - name: Cleanup
+      if: always()
+      run: |
+        docker stop riscv-test 2>/dev/null || true
+        docker rm riscv-test 2>/dev/null || true
