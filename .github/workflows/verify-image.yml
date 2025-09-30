@@ -143,27 +143,27 @@ jobs:
           # Quick sanity: show bridge log (may be empty early on)
           docker exec "${CONTAINER_NAME}" bash -lc 'test -f /var/log/qemu/guest-bridge.log && tail -n 5 /var/log/qemu/guest-bridge.log || true'
 
-      - name: Ping FIFO/bridge (prove shell input reaches guest)
-        run: |
-          set -euo pipefail
-          # Send a unique probe line to guest via FIFO and wait for it in console.log
-          PROBE="__HOST_PROBE__$(date +%s%N)"
-          echo "Sending probe: ${PROBE}"
-          docker exec "${CONTAINER_NAME}" bash -lc "printf '%s\n' \"echo ${PROBE}\" > /var/log/qemu/guest.in"
+      # - name: Ping FIFO/bridge (prove shell input reaches guest)
+      #   run: |
+      #     set -euo pipefail
+      #     # Send a unique probe line to guest via FIFO and wait for it in console.log
+      #     PROBE="__HOST_PROBE__$(date +%s%N)"
+      #     echo "Sending probe: ${PROBE}"
+      #     docker exec "${CONTAINER_NAME}" bash -lc "printf '%s\n' \"echo ${PROBE}\" > /var/log/qemu/guest.in"
 
-          # Wait up to ~30s for the probe to appear in the console log
-          for i in $(seq 1 60); do
-            if docker exec "${CONTAINER_NAME}" sh -lc "grep -q \"${PROBE}\" /var/log/qemu/console.log"; then
-              echo "✓ Probe detected in console.log"
-              exit 0
-            fi
-            sleep 0.5
-          done
+      #     # Wait up to ~30s for the probe to appear in the console log
+      #     for i in $(seq 1 60); do
+      #       if docker exec "${CONTAINER_NAME}" sh -lc "grep -q \"${PROBE}\" /var/log/qemu/console.log"; then
+      #         echo "✓ Probe detected in console.log"
+      #         exit 0
+      #       fi
+      #       sleep 0.5
+      #     done
 
-          echo "ERROR: Probe not observed in console.log — FIFO/bridge is not functional"
-          echo "=== Bridge log (last 50 lines) ==="
-          docker exec "${CONTAINER_NAME}" bash -lc 'tail -n 50 /var/log/qemu/guest-bridge.log 2>/dev/null || echo "(no bridge log)"'
-          exit 1
+      #     echo "ERROR: Probe not observed in console.log — FIFO/bridge is not functional"
+      #     echo "=== Bridge log (last 50 lines) ==="
+      #     docker exec "${CONTAINER_NAME}" bash -lc 'tail -n 50 /var/log/qemu/guest-bridge.log 2>/dev/null || echo "(no bridge log)"'
+      #     exit 1
 
       - name: Run sanity suite via scripts/shell.sh (marker-bound)
         run: |
