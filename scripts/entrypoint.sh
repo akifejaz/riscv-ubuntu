@@ -91,9 +91,27 @@ wait_for_console_line() {
 }
 
 # Send a raw string to the guest serial PTY (e.g., "\r", "uname -a\n")
+# Enhanced with retry logic and error handling
 send_to_console() {
   local pty="$1"; shift
-  printf "%b" "$*" > "$pty"
+  local max_retries=3
+  local retry=0
+  
+  while (( retry < max_retries )); do
+    if [[ -e "$pty" ]]; then
+      if printf "%b" "$*" > "$pty" 2>/dev/null; then
+        return 0
+      fi
+    fi
+    retry=$((retry + 1))
+    if (( retry < max_retries )); then
+      warn "Failed to write to PTY (attempt $retry/$max_retries), retrying..."
+      sleep 1
+    fi
+  done
+  
+  warn "Failed to write to PTY after $max_retries attempts"
+  return 1
 }
 
 # Use the HMP monitor to send a key (e.g., "ret" for Enter)
@@ -208,7 +226,7 @@ cmd_start() {
   # 4: Run sanity checks
   info "Running system sanity checks..."
   send_to_console "$PTY" "echo '=== System Information ==='\n"
-  sleep 0.5
+  sleep 1
   
   send_to_console "$PTY" "echo '--- Kernel Version ---'\n"
   send_to_console "$PTY" "uname -a\n"
@@ -244,8 +262,14 @@ cmd_start() {
     chmod 666 "$GUEST_IN_FIFO"
 
     # Start a background writer that forwards FIFO -> PTY
-    # -u: unbuffered; raw/echo=0 to avoid local echo/translation
-    ( socat -u - FILE:"$PTY",raw,echo=0 < "$GUEST_IN_FIFO" ) &
+    # Use a while loop to keep reading from FIFO and writing to PTY
+    (
+      while true; do
+        if read -r line < "$GUEST_IN_FIFO"; then
+          printf "%s\n" "$line" > "$PTY"
+        fi
+      done
+    ) &
     FIFO_WRITER_PID=$!
 
     info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
