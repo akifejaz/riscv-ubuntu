@@ -127,13 +127,13 @@ jobs:
               # Kill any stale bridge (best effort)
               pkill -f "cat /var/log/qemu/guest.in" 2>/dev/null || true
 
-              # Start FIFO -> PTY bridge in background, fully detached
-              # Use stdbuf to avoid stdio buffering; raw PTY, no echo in QEMU side is assumed
-              nohup bash -lc "
-                exec </dev/null >/var/log/qemu/guest-bridge.log 2>&1
-                set -e
-                stdbuf -i0 -o0 -e0 cat /var/log/qemu/guest.in > \"${PTY}\"
-              " >/dev/null 2>&1 &
+              # # Start FIFO -> PTY bridge in background, fully detached
+              # # Use stdbuf to avoid stdio buffering; raw PTY, no echo in QEMU side is assumed
+              # nohup bash -lc "
+              #   exec </dev/null >/var/log/qemu/guest-bridge.log 2>&1
+              #   set -e
+              #   stdbuf -i0 -o0 -e0 cat /var/log/qemu/guest.in > \"${PTY}\"
+              # " >/dev/null 2>&1 &
             '
           else
             echo "✓ guest.in FIFO present"
