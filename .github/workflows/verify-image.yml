@@ -101,19 +101,66 @@ jobs:
           set -euo pipefail
           echo "Verifying headless interface components..."
 
-          # PTY path inside container
-          if docker exec "${CONTAINER_NAME}" test -f /var/log/qemu/pty.path; then
-            PTY_PATH=$(docker exec "${CONTAINER_NAME}" cat /var/log/qemu/pty.path)
-            echo "Guest PTY: ${PTY_PATH}"
-            echo "GUEST_PTY=${PTY_PATH}" >> $GITHUB_ENV
+          # Must have PTY path
+          docker exec "${CONTAINER_NAME}" test -f /var/log/qemu/pty.path || { echo "ERROR: PTY path file not found"; exit 1; }
+          PTY_PATH="$(docker exec "${CONTAINER_NAME}" cat /var/log/qemu/pty.path)"
+          echo "Guest PTY: ${PTY_PATH}"
+          echo "GUEST_PTY=${PTY_PATH}" >> $GITHUB_ENV
+
+          # Ensure console.log exists (host-mounted)
+          docker exec "${CONTAINER_NAME}" test -f /var/log/qemu/console.log || { echo "ERROR: console.log missing"; exit 1; }
+
+          # Ensure FIFO exists; if missing, create it and start a bridge to the PTY
+          if ! docker exec "${CONTAINER_NAME}" test -p /var/log/qemu/guest.in; then
+            echo "guest.in FIFO missing — creating and starting bridge..."
+            docker exec "${CONTAINER_NAME}" bash -lc '
+              set -euo pipefail
+              mkdir -p /var/log/qemu
+              # Create FIFO if absent
+              [ -p /var/log/qemu/guest.in ] || mkfifo /var/log/qemu/guest.in
+              chmod 666 /var/log/qemu/guest.in || true
+
+              PTY="$(cat /var/log/qemu/pty.path)"
+              # Kill any stale bridge (best effort)
+              pkill -f "cat /var/log/qemu/guest.in" 2>/dev/null || true
+
+              # Start FIFO -> PTY bridge in background, fully detached
+              # Use stdbuf to avoid stdio buffering; raw PTY, no echo in QEMU side is assumed
+              nohup bash -lc "
+                exec </dev/null >/var/log/qemu/guest-bridge.log 2>&1
+                set -e
+                stdbuf -i0 -o0 -e0 cat /var/log/qemu/guest.in > \"${PTY}\"
+              " >/dev/null 2>&1 &
+            '
+            echo "✓ FIFO created and bridge started"
           else
-            echo "ERROR: PTY path file not found"
-            exit 1
+            echo "✓ guest.in FIFO present"
           fi
 
-          docker exec "${CONTAINER_NAME}" test -p /var/log/qemu/guest.in || { echo "ERROR: guest.in FIFO missing"; exit 1; }
-          docker exec "${CONTAINER_NAME}" test -f /var/log/qemu/console.log || { echo "ERROR: console.log missing"; exit 1; }
-          echo "✓ guest.in FIFO and console.log are present"
+          # Quick sanity: show bridge log (may be empty early on)
+          docker exec "${CONTAINER_NAME}" bash -lc 'test -f /var/log/qemu/guest-bridge.log && tail -n 5 /var/log/qemu/guest-bridge.log || true'
+
+      - name: Ping FIFO/bridge (prove shell input reaches guest)
+        run: |
+          set -euo pipefail
+          # Send a unique probe line to guest via FIFO and wait for it in console.log
+          PROBE="__HOST_PROBE__$(date +%s%N)"
+          echo "Sending probe: ${PROBE}"
+          docker exec "${CONTAINER_NAME}" bash -lc "printf '%s\n' \"echo ${PROBE}\" > /var/log/qemu/guest.in"
+
+          # Wait up to ~30s for the probe to appear in the console log
+          for i in $(seq 1 60); do
+            if docker exec "${CONTAINER_NAME}" sh -lc "grep -q \"${PROBE}\" /var/log/qemu/console.log"; then
+              echo "✓ Probe detected in console.log"
+              exit 0
+            fi
+            sleep 0.5
+          done
+
+          echo "ERROR: Probe not observed in console.log — FIFO/bridge is not functional"
+          echo "=== Bridge log (last 50 lines) ==="
+          docker exec "${CONTAINER_NAME}" bash -lc 'tail -n 50 /var/log/qemu/guest-bridge.log 2>/dev/null || echo "(no bridge log)"'
+          exit 1
 
       - name: Run sanity suite via scripts/shell.sh (marker-bound)
         run: |
