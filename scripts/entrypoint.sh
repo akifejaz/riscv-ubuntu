@@ -1,7 +1,6 @@
 #!/usr/bin/bash
 set -Eeuo pipefail
 
-# Keep your existing envs
 VM_IMAGE="/opt/riscv-vm/ubuntu-riscv64.qcow2"
 SEED_ISO="/opt/riscv-vm/cloud-init-seed.iso"
 RISCV_MEMORY=4G
@@ -11,9 +10,16 @@ LOG_DIR="/var/log/qemu"
 BOOT_LOG="$LOG_DIR/qemu.boot.log"         # QEMU's own stdout/stderr (to capture PTY line)
 CONSOLE_LOG="$LOG_DIR/console.log"        # Guest serial (what you normally see on console)
 MON_SOCK="/tmp/qemu-monitor.sock"         # HMP monitor (unix)
+CONSOLE_TMP="$CONSOLE_LOG.tmp"
 QEMU_PID_FILE="/tmp/qemu.pid"
+PTY_PATH_FILE="$LOG_DIR/pty.path"         # For automation discovery
+GUEST_IN_FIFO="$LOG_DIR/guest.in"         # FIFO for headless command injection
+
+# Control whether to attach interactively or run headless (CI/local script)
+AUTO_ATTACH="${AUTO_ATTACH:-1}"
 
 info() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
+warn() { printf '[%s] WARNING: %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
 die()  { printf '[%s] ERROR: %s\n' "$(date +%H:%M:%S)" "$*" >&2; exit 1; }
 
 build_qemu_cmd() {
@@ -40,7 +46,7 @@ build_qemu_cmd() {
   if [[ -n "${QEMU_OPTS:-}" ]]; then
     # shellcheck disable=SC2206
     EXTRA_OPTS=(${QEMU_OPTS})
-    QEMU_CMD+=("${EXTRA_OPTS[@]}")
+    QEMU_CMD=("${EXTRA_OPTS[@]}")
   fi
 }
 
@@ -49,7 +55,7 @@ find_console_pty() {
   local pty=""
   for _ in {1..60}; do
     if [[ -f "$BOOT_LOG" ]]; then
-      pty="$(grep -oE 'char device redirected to (/dev/pts/[0-9]+)' "$BOOT_LOG" | awk '{print $5}' | tail -n1 || true)"
+      pty="$(grep -oE 'char device redirected to (/dev/pts/[0-9])' "$BOOT_LOG" | awk '{print $5}' | tail -n1 || true)"
       if [[ -n "$pty" && -e "$pty" ]]; then
         echo "$pty"
         return 0
@@ -134,43 +140,146 @@ cmd_start() {
   stdbuf -oL cat "$PTY" >> "$CONSOLE_LOG" &
   CONSOLE_READER_PID=$!
 
-  # --- Sanity checks ---
+  echo "$PTY" > "$PTY_PATH_FILE"
+  chmod 644 "$PTY_PATH_FILE"
 
-  # 1) Wait for boot-ready message
-  if wait_for_console_line "RISC-V Ubuntu image is ready\.|Ubuntu .* ttyS0|cloud-init.*finished"; then
-    info "Boot-ready line detected."
+  # --- Enhanced Boot Detection Flow ---
+
+  # 1: Wait for initial boot completion
+  info "Waiting for boot to complete..."
+  if wait_for_console_line "Ubuntu .* ttyS0|cloud-init.*finished"; then
+    info "✓ Boot sequence completed (cloud-init finished)."
   else
-    info "Boot-ready line not found before timeout; proceeding anyway."
+    warn "Boot completion marker not detected before timeout."
   fi
 
-  # 2) If shell not visible, "press Enter"
-  # Heuristics: look for a prompt or 'login:'; if not present, press Enter
-  if ! grep -Eq "login:|# $|~\$ $|root@|ubuntu@" "$CONSOLE_LOG" 2>/dev/null; then
-    info "Shell prompt not obvious; sending Enter..."
-    # Try both via monitor and direct PTY
-    monitor_sendkey ret
+  # 2: Wait for auto-login to complete
+  info "Waiting for auto-login..."
+  if wait_for_console_line "RISC-V Ubuntu image is ready\."; then
+    info "✓ Auto-login successful - shell is ready."
+  else
+    warn "Auto-login confirmation not detected; attempting to proceed."
+    # Fallback: send Enter to trigger prompt
+    info "Sending Enter to activate shell..."
     send_to_console "$PTY" "\r"
+    sleep 2
   fi
 
-  # 3) Print basic info
-  info "Querying uname and cpuinfo (printing to console)..."
-  send_to_console "$PTY" "echo '--- uname -a ---'\n"
-  send_to_console "$PTY" "uname -a\n"
-  send_to_console "$PTY" "echo '--- cpuinfo (first 20 lines) ---'\n"
-  send_to_console "$PTY" "head -n 20 /proc/cpuinfo\n"
+  # 3: Verify shell is responsive
+  info "Verifying shell responsiveness..."
+  sleep 1
 
-  # Give the guest a moment to print those
-  sleep 2
-
-  # Stop the temporary reader (we're about to hand off the PTY to the user)
   kill "$CONSOLE_READER_PID" 2>/dev/null || true
   wait "$CONSOLE_READER_PID" 2>/dev/null || true
 
-  info "Handing over interactive console. (To exit QEMU: press Ctrl+A then X)"
-  # From now on, user is directly attached to the guest serial
-  # Replace our shell with a bidirectional PTY bridge
-  trap - EXIT
-  exec socat -,raw,echo=0 FILE:"$PTY",raw,echo=0
+  stdbuf -oL cat "$PTY" >> "$CONSOLE_LOG" &
+  CONSOLE_READER_PID=$!
+
+  
+  # Send a simple test command to verify shell is ready
+  local shell_responsive=0
+  if send_to_console "$PTY" "echo SHELL_READY\n"; then
+    sleep 2
+    
+    if grep -q "SHELL_READY" "$CONSOLE_LOG" 2>/dev/null; then
+      info "✓ Shell is responsive."
+      shell_responsive=1
+    else
+      warn "Shell not responding to test command; attempting recovery..."
+      # Fallback: press Enter and retry
+      send_to_console "$PTY" "\r"
+      sleep 1
+      
+      # Clear marker and try again
+      send_to_console "$PTY" "echo SHELL_READY_RETRY\n"
+      sleep 2
+      
+      if grep -q "SHELL_READY_RETRY" "$CONSOLE_LOG" 2>/dev/null; then
+        info "✓ Shell is responsive after Enter press."
+        shell_responsive=1
+      else
+        warn "Shell still not responsive; continuing anyway - manual intervention may be needed."
+      fi
+    fi
+  else
+    warn "Unable to send test command to PTY; continuing anyway."
+  fi
+
+  # 4: Run sanity checks
+  info "Running system sanity checks..."
+  send_to_console "$PTY" "echo '=== System Information ==='\n"
+  sleep 0.5
+  
+  send_to_console "$PTY" "echo '--- Kernel Version ---'\n"
+  send_to_console "$PTY" "uname -a\n"
+  sleep 1
+  
+  send_to_console "$PTY" "echo '--- CPU Information ---'\n"
+  send_to_console "$PTY" "head -n 20 /proc/cpuinfo\n"
+  sleep 1
+  
+  send_to_console "$PTY" "echo '--- Memory Information ---'\n"
+  send_to_console "$PTY" "free -h\n"
+  sleep 1
+  
+  send_to_console "$PTY" "echo '--- Disk Usage ---'\n"
+  send_to_console "$PTY" "df -h /\n"
+  sleep 1
+
+  send_to_console "$PTY" "echo '=== Sanity Checks Complete ==='\n"
+  
+  # Give output time to appear
+  sleep 2
+
+  # 5: Transfer control to user
+  if [[ "$AUTO_ATTACH" == "0" ]]; then
+    # ---- Headless/CI mode ----
+    info "Headless mode enabled (AUTO_ATTACH=0). Keeping console reader and exposing FIFO."
+
+    # Create a FIFO for safe command injection from outside
+    if [[ -p "$GUEST_IN_FIFO" ]]; then
+      rm -f "$GUEST_IN_FIFO"
+    fi
+    mkfifo "$GUEST_IN_FIFO"
+    chmod 666 "$GUEST_IN_FIFO"
+
+    # Start a background writer that forwards FIFO -> PTY
+    # -u: unbuffered; raw/echo=0 to avoid local echo/translation
+    ( socat -u - FILE:"$PTY",raw,echo=0 < "$GUEST_IN_FIFO" ) &
+    FIFO_WRITER_PID=$!
+
+    info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    info "System is ready for headless operation"
+    info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    info "PTY path: $(cat "$PTY_PATH_FILE")"
+    info "Write guest commands to: $GUEST_IN_FIFO"
+    info "View console at: $CONSOLE_LOG"
+    info "HMP monitor socket: $MON_SOCK (e.g., 'sendkey ret')"
+
+    # Keep the entrypoint alive; let docker logs show our boot log as well
+    # Do not kill the console reader; we want continuous logging.
+    trap - EXIT
+    # Idle loop instead of 'tail -f' to avoid exit if file rotates
+    while :; do sleep 3600; done
+  else
+    # ---- Interactive mode ----
+    # Stop the temporary reader (we're about to hand off the PTY to the user)
+    kill "$CONSOLE_READER_PID" 2>/dev/null || true
+    wait "$CONSOLE_READER_PID" 2>/dev/null || true
+
+    info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    info "System ready - transferring control to user"
+    info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    info "(To exit QEMU: press Ctrl-A then X)"
+    
+    # Brief pause so user sees the message
+    sleep 1
+    
+    # From now on, user is directly attached to the guest serial
+    # Replace our shell with a bidirectional PTY bridge
+    trap - EXIT
+    exec socat -,raw,echo=0 FILE:"$PTY",raw,echo=0
+  fi
 }
 
 case "${1:-start}" in
