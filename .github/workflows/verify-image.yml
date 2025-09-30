@@ -119,7 +119,10 @@ jobs:
               # Create FIFO if absent
               [ -p /var/log/qemu/guest.in ] || mkfifo /var/log/qemu/guest.in
               chmod 666 /var/log/qemu/guest.in || true
-
+            '
+            echo "✓ FIFO created"
+            
+            docker exec "${CONTAINER_NAME}" bash -lc '
               PTY="$(cat /var/log/qemu/pty.path)"
               # Kill any stale bridge (best effort)
               pkill -f "cat /var/log/qemu/guest.in" 2>/dev/null || true
@@ -132,7 +135,6 @@ jobs:
                 stdbuf -i0 -o0 -e0 cat /var/log/qemu/guest.in > \"${PTY}\"
               " >/dev/null 2>&1 &
             '
-            echo "✓ FIFO created and bridge started"
           else
             echo "✓ guest.in FIFO present"
           fi
