@@ -131,33 +131,36 @@ jobs:
 
           # Start FIFO bridge if not running
           echo "=== Starting FIFO -> PTY bridge ==="
-          docker exec "${CONTAINER_NAME}" bash -lc '
-            set -euo pipefail
+          docker exec -d "${CONTAINER_NAME}" bash -c '
             PTY="$(cat /var/log/qemu/pty.path)"
+            exec >/var/log/qemu/guest-bridge.log 2>&1
+            echo "Bridge starting at $(date)"
+            echo "PTY: ${PTY}"
+            echo "FIFO: /var/log/qemu/guest.in"
             
-            # Kill any existing bridge
-            pkill -f "cat /var/log/qemu/guest.in" 2>/dev/null || true
-            sleep 0.5
-            
-            # Start bridge in background
-            nohup bash -c "
-              exec </dev/null >/var/log/qemu/guest-bridge.log 2>&1
-              echo \"Bridge started at \$(date)\"
-              echo \"Reading from /var/log/qemu/guest.in\"
-              echo \"Writing to ${PTY}\"
-              stdbuf -i0 -o0 -e0 cat /var/log/qemu/guest.in > \"${PTY}\"
-            " >/dev/null 2>&1 &
-            
-            BRIDGE_PID=$!
-            echo "Bridge process started with PID: ${BRIDGE_PID}"
-            sleep 1
-            
-            # Verify bridge is running
-            if ps -p ${BRIDGE_PID} >/dev/null 2>&1; then
+            # This will block reading from FIFO until data arrives
+            while true; do
+              if [ -p /var/log/qemu/guest.in ] && [ -c "${PTY}" ]; then
+                cat /var/log/qemu/guest.in > "${PTY}" || {
+                  echo "Bridge cat failed, restarting in 1s..."
+                  sleep 1
+                }
+              else
+                echo "FIFO or PTY missing, waiting..."
+                sleep 1
+              fi
+            done
+          '
+          
+          sleep 2
+          
+          echo "=== Checking bridge status ==="
+          docker exec "${CONTAINER_NAME}" bash -c '
+            if pgrep -f "cat /var/log/qemu/guest.in" >/dev/null; then
               echo "✓ Bridge process is running"
+              pgrep -af "cat /var/log/qemu/guest.in"
             else
-              echo "WARNING: Bridge process may have exited"
-              cat /var/log/qemu/guest-bridge.log 2>/dev/null || true
+              echo "WARNING: Bridge process not found"
             fi
           '
           
