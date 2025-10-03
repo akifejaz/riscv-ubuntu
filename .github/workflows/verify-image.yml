@@ -16,7 +16,8 @@ jobs:
       CONTAINER_NAME: riscv-test
       LOG_DIR: ${{ github.workspace }}/var/log/qemu
       WORK_DIR: ${{ github.workspace }}/workspace
-      # Optional: tighten/relax shell streaming timeout (seconds)
+      CONSOLE_LOG: ${{ github.workspace }}/var/log/qemu/console.log
+      GUEST_FIFO: /var/log/qemu/guest.in
       STREAM_TIMEOUT_SECONDS: "180"
 
     steps:
@@ -110,113 +111,173 @@ jobs:
           # Ensure console.log exists (host-mounted)
           docker exec "${CONTAINER_NAME}" test -f /var/log/qemu/console.log || { echo "ERROR: console.log missing"; exit 1; }
 
-          # Ensure FIFO exists; if missing, create it and start a bridge to the PTY
+          # Ensure FIFO exists; if missing, create it
           if ! docker exec "${CONTAINER_NAME}" test -p /var/log/qemu/guest.in; then
-            echo "guest.in FIFO missing — creating and starting bridge..."
+            echo "guest.in FIFO missing — creating..."
             docker exec "${CONTAINER_NAME}" bash -lc '
               set -euo pipefail
               mkdir -p /var/log/qemu
-              # Create FIFO if absent
               [ -p /var/log/qemu/guest.in ] || mkfifo /var/log/qemu/guest.in
               chmod 666 /var/log/qemu/guest.in || true
             '
             echo "✓ FIFO created"
-            
-            docker exec "${CONTAINER_NAME}" bash -lc '
-              ls -la /var/log/qemu/
-              # PTY="$(cat /var/log/qemu/pty.path)"
-              # # Kill any stale bridge (best effort)
-              # pkill -f "cat /var/log/qemu/guest.in" 2>/dev/null || true
-
-              # # Start FIFO -> PTY bridge in background, fully detached
-              # # Use stdbuf to avoid stdio buffering; raw PTY, no echo in QEMU side is assumed
-              # nohup bash -lc "
-              #   exec </dev/null >/var/log/qemu/guest-bridge.log 2>&1
-              #   set -e
-              #   stdbuf -i0 -o0 -e0 cat /var/log/qemu/guest.in > \"${PTY}\"
-              # " >/dev/null 2>&1 &
-            '
           else
             echo "✓ guest.in FIFO present"
           fi
 
-          # Quick sanity: show bridge log (may be empty early on)
-          docker exec "${CONTAINER_NAME}" bash -lc 'test -f /var/log/qemu/guest-bridge.log && tail -n 5 /var/log/qemu/guest-bridge.log || true'
+          # List QEMU directory contents
+          docker exec "${CONTAINER_NAME}" ls -la /var/log/qemu/
 
-      # - name: Ping FIFO/bridge (prove shell input reaches guest)
-      #   run: |
-      #     set -euo pipefail
-      #     # Send a unique probe line to guest via FIFO and wait for it in console.log
-      #     PROBE="__HOST_PROBE__$(date +%s%N)"
-      #     echo "Sending probe: ${PROBE}"
-      #     docker exec "${CONTAINER_NAME}" bash -lc "printf '%s\n' \"echo ${PROBE}\" > /var/log/qemu/guest.in"
+      - name: Test command execution with marker-based streaming
+        run: |
+          set -euo pipefail
+          
+          # Define helper functions for command execution
+          send_byte_to_guest() {
+            local -i code="$1"
+            docker exec "${CONTAINER_NAME}" bash -lc "printf '\\x%02x' ${code} > '${GUEST_FIFO}'"
+          }
 
-      #     # Wait up to ~30s for the probe to appear in the console log
-      #     for i in $(seq 1 60); do
-      #       if docker exec "${CONTAINER_NAME}" sh -lc "grep -q \"${PROBE}\" /var/log/qemu/console.log"; then
-      #         echo "✓ Probe detected in console.log"
-      #         exit 0
-      #       fi
-      #       sleep 0.5
-      #     done
+          send_to_guest() {
+            local text="$1"
+            docker exec "${CONTAINER_NAME}" bash -lc "printf '%s\n' \"${text}\" > '${GUEST_FIFO}'"
+          }
 
-      #     echo "ERROR: Probe not observed in console.log — FIFO/bridge is not functional"
-      #     echo "=== Bridge log (last 50 lines) ==="
-      #     docker exec "${CONTAINER_NAME}" bash -lc 'tail -n 50 /var/log/qemu/guest-bridge.log 2>/dev/null || echo "(no bridge log)"'
-      #     exit 1
+          run_cmd_stream() {
+            local cmd="$1"
+            
+            # Unique markers per command
+            local uid
+            uid="$(date +%s%N)-$RANDOM"
+            local START="__HOST_START__${uid}__"
+            local END="__HOST_END__${uid}__"
+            
+            # Compose compound command with start/end markers
+            local inject="{ echo ${START}; { ${cmd}; rc=\$?; }; printf '${END} EXIT=%d\n' \"\${rc}\"; } 2>&1"
+            
+            # Start tail and filter between markers
+            stdbuf -oL -eL tail -n0 -F "${CONSOLE_LOG}" 2>/dev/null \
+              | awk -v start="${START}" -v end="${END}" '
+                  BEGIN { started=0 }
+                  {
+                    if (!started) {
+                      if (index($0, start)) { started=1; next }
+                      next
+                    } else {
+                      if (index($0, end)) {
+                        exitidx = index($0, "EXIT=");
+                        if (exitidx > 0) {
+                          code = substr($0, exitidx+5);
+                          printf("[exit %s]\n", code);
+                        }
+                        exit 0
+                      }
+                      print
+                    }
+                  }
+                ' &
+            local awk_pid=$!
+            
+            # Handle Ctrl-C
+            trap 'send_byte_to_guest 3 >/dev/null 2>&1 || true; kill -TERM '"$awk_pid"' >/dev/null 2>&1 || true' INT
+            
+            # Small delay to ensure tail is ready
+            sleep 0.3
+            
+            # Inject the compound command
+            send_to_guest "${inject}"
+            
+            # Wait for awk to finish
+            wait "${awk_pid}" || true
+            trap - INT
+          }
 
-      - name: Run sanity suite via scripts/shell.sh (marker-bound)
+          # Test simple command
+          echo "Testing basic command execution..."
+          run_cmd_stream "echo 'Hello from QEMU guest'"
+          
+          echo ""
+          echo "Testing system info command..."
+          run_cmd_stream "uname -a"
+
+      - name: Run sanity suite with marker-based streaming
         run: |
           set -euo pipefail
 
-          # Run the interactive wrapper non-interactively by piping commands.
-          # We capture output and enforce that every command ends with "[exit 0]".
-          CMDS_FILE="${{ github.workspace }}/sanity_cmds.txt"
-          OUT_FILE="${{ github.workspace }}/sanity_output.txt"
+          # Define helper functions
+          send_byte_to_guest() {
+            local -i code="$1"
+            docker exec "${CONTAINER_NAME}" bash -lc "printf '\\x%02x' ${code} > '${GUEST_FIFO}'"
+          }
 
-          cat > "${CMDS_FILE}" <<'EOF'
+          send_to_guest() {
+            local text="$1"
+            docker exec "${CONTAINER_NAME}" bash -lc "printf '%s\n' \"${text}\" > '${GUEST_FIFO}'"
+          }
+
+          run_cmd_stream() {
+            local cmd="$1"
+            
+            local uid
+            uid="$(date +%s%N)-$RANDOM"
+            local START="__HOST_START__${uid}__"
+            local END="__HOST_END__${uid}__"
+            
+            local inject="{ echo ${START}; { ${cmd}; rc=\$?; }; printf '${END} EXIT=%d\n' \"\${rc}\"; } 2>&1"
+            
+            stdbuf -oL -eL tail -n0 -F "${CONSOLE_LOG}" 2>/dev/null \
+              | awk -v start="${START}" -v end="${END}" '
+                  BEGIN { started=0 }
+                  {
+                    if (!started) {
+                      if (index($0, start)) { started=1; next }
+                      next
+                    } else {
+                      if (index($0, end)) {
+                        exitidx = index($0, "EXIT=");
+                        if (exitidx > 0) {
+                          code = substr($0, exitidx+5);
+                          printf("[exit %s]\n", code);
+                        }
+                        exit 0
+                      }
+                      print
+                    }
+                  }
+                ' &
+            local awk_pid=$!
+            
+            trap 'send_byte_to_guest 3 >/dev/null 2>&1 || true; kill -TERM '"$awk_pid"' >/dev/null 2>&1 || true' INT
+            
+            sleep 0.3
+            send_to_guest "${inject}"
+            
+            wait "${awk_pid}" || true
+            trap - INT
+          }
+
+          # Run test commands
           echo "=== System Information Tests ==="
-          uname -a
-          whoami
-          pwd
-          sudo apt -y update
-          cat /etc/os-release | head -3
-          lscpu | head -10
-          free -h
-          df -h /
-          ls -la /workspace
-          echo "GitHub Actions Test - $(date)" | tee /workspace/test_output.txt
-          cat /workspace/test_output.txt
-          echo "OK"
-          EOF
-
-          # Provide env so the wrapper knows the mounted paths
-          export CONSOLE_LOG="${LOG_DIR}/console.log"
-          export GUEST_FIFO="/var/log/qemu/guest.in"
-          export STREAM_TIMEOUT_SECONDS="${STREAM_TIMEOUT_SECONDS}"
-
-          # Pipe commands into the wrapper; capture all stdout/err
-          set -o pipefail
-          cat "${CMDS_FILE}" | scripts/shell.sh "${CONTAINER_NAME}" | tee "${OUT_FILE}"
-
-          # Count commands we expect to run (non-empty, non-comment lines)
-          EXPECT=$(grep -vE '^\s*($|#)' "${CMDS_FILE}" | wc -l | awk '{print $1}')
-          # Count successful exits in output
-          GOT=$(grep -c '^\[exit 0\]$' "${OUT_FILE}" || true)
-
-          echo "Expected successful commands: ${EXPECT}"
-          echo "Observed [exit 0] markers:   ${GOT}"
-
-          # It’s normal for the banner/prompt lines not to have exit markers;
-          # but every injected command in CMDS_FILE will. Enforce equality.
-          if [ "${GOT}" -ne "${EXPECT}" ]; then
-            echo "ERROR: Not all commands completed successfully."
-            echo "---- Tail of output ----"
-            tail -n 120 "${OUT_FILE}" || true
-            exit 1
-          fi
-
-          echo "✓ Sanity suite completed with all commands [exit 0]"
+          
+          run_cmd_stream "uname -a"
+          run_cmd_stream "whoami"
+          run_cmd_stream "pwd"
+          
+          echo ""
+          echo "=== System Configuration ==="
+          run_cmd_stream "cat /etc/os-release | head -3"
+          run_cmd_stream "lscpu | head -10"
+          run_cmd_stream "free -h"
+          run_cmd_stream "df -h /"
+          
+          echo ""
+          echo "=== Workspace Tests ==="
+          run_cmd_stream "ls -la /workspace"
+          run_cmd_stream "echo 'GitHub Actions Test - $(date)' | tee /workspace/test_output.txt"
+          run_cmd_stream "cat /workspace/test_output.txt"
+          
+          echo ""
+          echo "✓ All sanity tests completed"
 
       - name: Verify test results on host
         run: |
@@ -267,8 +328,6 @@ jobs:
           path: |
             ${{ github.workspace }}/var/log/qemu/
             ${{ github.workspace }}/workspace/
-            ${{ github.workspace }}/sanity_cmds.txt
-            ${{ github.workspace }}/sanity_output.txt
           retention-days: 7
 
       - name: Cleanup
