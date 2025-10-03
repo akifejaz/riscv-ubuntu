@@ -126,9 +126,46 @@ jobs:
           fi
 
           # List QEMU directory contents
+          echo "=== QEMU directory contents ==="
           docker exec "${CONTAINER_NAME}" ls -la /var/log/qemu/
 
+          # Start FIFO bridge if not running
+          echo "=== Starting FIFO -> PTY bridge ==="
+          docker exec "${CONTAINER_NAME}" bash -lc '
+            set -euo pipefail
+            PTY="$(cat /var/log/qemu/pty.path)"
+            
+            # Kill any existing bridge
+            pkill -f "cat /var/log/qemu/guest.in" 2>/dev/null || true
+            sleep 0.5
+            
+            # Start bridge in background
+            nohup bash -c "
+              exec </dev/null >/var/log/qemu/guest-bridge.log 2>&1
+              echo \"Bridge started at \$(date)\"
+              echo \"Reading from /var/log/qemu/guest.in\"
+              echo \"Writing to ${PTY}\"
+              stdbuf -i0 -o0 -e0 cat /var/log/qemu/guest.in > \"${PTY}\"
+            " >/dev/null 2>&1 &
+            
+            BRIDGE_PID=$!
+            echo "Bridge process started with PID: ${BRIDGE_PID}"
+            sleep 1
+            
+            # Verify bridge is running
+            if ps -p ${BRIDGE_PID} >/dev/null 2>&1; then
+              echo "✓ Bridge process is running"
+            else
+              echo "WARNING: Bridge process may have exited"
+              cat /var/log/qemu/guest-bridge.log 2>/dev/null || true
+            fi
+          '
+          
+          echo "=== Bridge log ==="
+          docker exec "${CONTAINER_NAME}" cat /var/log/qemu/guest-bridge.log 2>/dev/null || echo "(no bridge log yet)"
+
       - name: Test command execution with marker-based streaming
+        timeout-minutes: 5
         run: |
           set -euo pipefail
           
@@ -140,11 +177,16 @@ jobs:
 
           send_to_guest() {
             local text="$1"
+            echo "DEBUG: Sending to guest: ${text:0:80}..." >&2
             docker exec "${CONTAINER_NAME}" bash -lc "printf '%s\n' \"${text}\" > '${GUEST_FIFO}'"
+            echo "DEBUG: Send completed" >&2
           }
 
           run_cmd_stream() {
             local cmd="$1"
+            local timeout="${2:-60}"
+            
+            echo ">>> Running command: ${cmd}"
             
             # Unique markers per command
             local uid
@@ -155,16 +197,23 @@ jobs:
             # Compose compound command with start/end markers
             local inject="{ echo ${START}; { ${cmd}; rc=\$?; }; printf '${END} EXIT=%d\n' \"\${rc}\"; } 2>&1"
             
-            # Start tail and filter between markers
-            stdbuf -oL -eL tail -n0 -F "${CONSOLE_LOG}" 2>/dev/null \
+            echo "DEBUG: Starting tail process..." >&2
+            
+            # Start tail and filter between markers with timeout
+            timeout ${timeout}s stdbuf -oL -eL tail -n0 -F "${CONSOLE_LOG}" 2>/dev/null \
               | awk -v start="${START}" -v end="${END}" '
                   BEGIN { started=0 }
                   {
                     if (!started) {
-                      if (index($0, start)) { started=1; next }
+                      if (index($0, start)) { 
+                        started=1
+                        print "[DEBUG] Found START marker" > "/dev/stderr"
+                        next 
+                      }
                       next
                     } else {
                       if (index($0, end)) {
+                        print "[DEBUG] Found END marker" > "/dev/stderr"
                         exitidx = index($0, "EXIT=");
                         if (exitidx > 0) {
                           code = substr($0, exitidx+5);
@@ -178,27 +227,58 @@ jobs:
                 ' &
             local awk_pid=$!
             
+            echo "DEBUG: Tail/awk PID: ${awk_pid}" >&2
+            
             # Handle Ctrl-C
             trap 'send_byte_to_guest 3 >/dev/null 2>&1 || true; kill -TERM '"$awk_pid"' >/dev/null 2>&1 || true' INT
             
             # Small delay to ensure tail is ready
-            sleep 0.3
+            sleep 1
             
             # Inject the compound command
             send_to_guest "${inject}"
             
-            # Wait for awk to finish
-            wait "${awk_pid}" || true
+            echo "DEBUG: Waiting for command completion..." >&2
+            
+            # Wait for awk to finish with timeout
+            if wait "${awk_pid}" 2>/dev/null; then
+              echo "DEBUG: Command completed successfully" >&2
+            else
+              local exit_code=$?
+              echo "WARNING: Wait exited with code ${exit_code}" >&2
+            fi
+            
             trap - INT
+            echo ""
           }
 
-          # Test simple command
-          echo "Testing basic command execution..."
-          run_cmd_stream "echo 'Hello from QEMU guest'"
+          # First, verify bridge is working with a simple test
+          echo "=== Testing FIFO/PTY bridge ==="
+          PROBE="__BRIDGE_TEST__$(date +%s)"
+          echo "Sending probe: ${PROBE}"
           
+          docker exec "${CONTAINER_NAME}" bash -lc "echo 'echo ${PROBE}' > '${GUEST_FIFO}'"
+          
+          sleep 2
+          
+          if docker exec "${CONTAINER_NAME}" grep -q "${PROBE}" /var/log/qemu/console.log; then
+            echo "✓ Bridge is working - probe found in console.log"
+          else
+            echo "✗ Bridge test failed - probe not found"
+            echo "=== Console log (last 50 lines) ==="
+            docker exec "${CONTAINER_NAME}" tail -n 50 /var/log/qemu/console.log
+            echo "=== Bridge log ==="
+            docker exec "${CONTAINER_NAME}" cat /var/log/qemu/guest-bridge.log 2>/dev/null || echo "(no log)"
+            exit 1
+          fi
+
+          # Test simple command
           echo ""
-          echo "Testing system info command..."
-          run_cmd_stream "uname -a"
+          echo "=== Testing basic command execution ==="
+          run_cmd_stream "echo 'Hello from QEMU guest'" 30
+          
+          echo "=== Testing system info command ==="
+          run_cmd_stream "uname -a" 30
 
       - name: Run sanity suite with marker-based streaming
         run: |
