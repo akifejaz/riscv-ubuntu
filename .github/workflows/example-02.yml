@@ -8,9 +8,8 @@
 #
 # Documentation: https://github.com/cloudv10x/riscv-qemu-ubuntu
 
-name: Testing on RISC-V Ubuntu # running by qemu-system-riscv64 
+name: Testing on RISC-V Ubuntu # running by qemu-system-riscv64
 
-# EDIT : Change triggers as needed for your use case
 on:
   push:
     branches: [ main, dev ]
@@ -21,119 +20,53 @@ on:
 jobs:
   qemu-system-riscv64-ubuntu:
     runs-on: ubuntu-latest
+
+    # Job-level env (used by steps; NOT by container.options)
     env:
+      CONTAINER_NAME: riscv-test
       WORK_DIR: ${{ github.workspace }}
       LOG_DIR: ${{ github.workspace }}/var/log/qemu
-      CONTAINER_NAME: riscv-test
       CONSOLE_LOG: ${{ github.workspace }}/var/log/qemu/console.log
       GUEST_FIFO: /var/log/qemu/guest.in
 
     container:
       image: cloudv10x/riscv-qemu-ubuntu:latest
+      # container.options is resolved before env; use github.* only or literals
       options: >-
-        --name ${{ env.CONTAINER_NAME }}
+        --name riscv-test
         --privileged
-        -v ${{ env.WORK_DIR }}:/workspace
-        -v ${{ env.LOG_DIR }}:/var/log/qemu
+        -v ${{ github.workspace }}:/workspace
+        -v ${{ github.workspace }}/var/log/qemu:/var/log/qemu
         -e AUTO_ATTACH=0
         -e RUN_TESTS=0
 
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Prepare log directories
         run: |
           set -euo pipefail
-          mkdir -p "${LOG_DIR}" 
+          mkdir -p "${LOG_DIR}"
           chmod 755 "${LOG_DIR}"
-          
-          # pull common functions
+          # pull common functions (now that repo is checked out)
           chmod +x "${GITHUB_WORKSPACE}/.github/scripts/common.sh"
           echo "BASH_ENV=${GITHUB_WORKSPACE}/.github/scripts/common.sh" >> "$GITHUB_ENV"
 
-      - name: Pull RISC-V image and start container
+      - name: Confirm job container is up (no docker ps needed)
         run: |
-          #start_qemu_container "${CONTAINER_NAME}" "${WORK_DIR}" "${LOG_DIR}" "cloudv10x/riscv-qemu-ubuntu:latest"
-
-          if docker ps --filter "name=^${CONTAINER_NAME}$" --filter "status=running" --format '{{.Names}}' | grep -qx "${CONTAINER_NAME}"; then
-            echo "Container '${CONTAINER_NAME}' is running."
-            exit 0
-          else
-            echo " Container '${CONTAINER_NAME}' is NOT running!"
-            echo "---- Docker ps output ----"
-            docker ps -a --format "table {{.Names}}\t{{.Status}}\t{{.Image}}"
-            echo "--------------------------"
-            exit 1
-          fi
+          set -euo pipefail
+          echo "Hostname: $(hostname)"
+          echo "Verifying mounts..."
+          test -d /workspace && echo "OK /workspace"
+          test -d /var/log/qemu && echo "OK /var/log/qemu"
+          echo "Listing /var/log/qemu:"
+          ls -alh /var/log/qemu || true
 
       - name: Wait for QEMU system boot
         timeout-minutes: 10
         run: |
+          set -euo pipefail
           wait_for_qemu_boot "${CONTAINER_NAME}" "${CONSOLE_LOG}" 600 5
-          
           GUEST_DETAILS="${CONTAINER_NAME} ${GUEST_FIFO} ${CONSOLE_LOG}"
-          echo "GUEST_DETAILS=${GUEST_DETAILS}" >> $GITHUB_ENV
-
-      - name: Setup Guest Interface
-        run: |
-          setup_guest_interface "${CONTAINER_NAME}" "${GUEST_FIFO}" 
-
-          sleep 1
-          echo "Verifying /workspace visibility inside QEMU guest..."
-          run_guest ${GUEST_DETAILS} "echo 'Current working directory:' && pwd"
-          run_guest ${GUEST_DETAILS} "echo 'Listing contents of current directory:' && ls -alh \"\\\$PWD\""
-
-      # ============================================================================
-      # YOUR TESTS GO HERE
-      # ============================================================================
-      # Replace the examples below with your own test commands
-      # Use run_guest() for commands where you need to see output
-      # Use send_cmd() for simple commands without output capture
-      # ============================================================================
-      - name: Run guest tests in RISC-V environment
-        if: success()
-        run: |
-          # Example Usage
-          run_guest ${GUEST_DETAILS} "uname -a"
-          run_guest ${GUEST_DETAILS} "cat /etc/os-release | grep -E '^(NAME|VERSION)='"
-          run_guest ${GUEST_DETAILS} "sudo apt-get update && sudo apt-get install -y git curl tree" 
-          sleep 15
-          
-          run_guest ${GUEST_DETAILS} "whoami; printf 'HOME=%s\n' \"\\\$HOME\"; pwd; ls -alh ~"
-          run_guest  ${GUEST_DETAILS} \
-          "git clone --branch '${GITHUB_REF_NAME}' https://github.com/${{ github.repository }}.git \"\\\$HOME/repo\" --recurse-submodules && \
-          cd \"\\\$HOME/repo\" && git checkout '${GITHUB_SHA}'"
-
-          # Add your tests here 
-          run_guest ${GUEST_DETAILS} "echo 'Directory tree (limited depth=2):' && ls -alh ."
-          
-          echo "✓ All tests completed successfully"
-
-
-      - name: Capture diagnostics on failure
-        if: failure()
-        run: |
-          echo "=== Failure Diagnostics ==="
-          echo "Container status:"
-          docker ps -a --filter "name=${CONTAINER_NAME}"
-          
-          echo -e "\n=== Last 100 console lines ==="
-          docker exec "${CONTAINER_NAME}" tail -n 100 "${CONSOLE_LOG}" 2>/dev/null || \
-            echo "Console log unavailable"
-          
-          echo -e "\n=== Container logs ==="
-          docker logs --tail 50 "${CONTAINER_NAME}" 2>&1 || echo "Container logs unavailable"
-
-      - name: Upload logs on completion
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: riscv-qemu-logs
-          path: ${{ github.workspace }}/var/log/qemu/
-          retention-days: 7
-          if-no-files-found: warn
-
-      - name: Cleanup resources
-        if: always()
-        run: |
-          docker stop "${CONTAINER_NAME}" 2>/dev/null || true
-          docker rm "${CONTAINER_NAME}" 2>/dev/null || true
-          echo "✓ Cleanup complete"
+          echo "GUEST_DETAILS=${GUEST_DETAILS}" >> "$GITHUB_ENV"
