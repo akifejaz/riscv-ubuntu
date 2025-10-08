@@ -17,6 +17,7 @@ GUEST_IN_FIFO="$LOG_DIR/guest.in"         # FIFO for headless command injection
 
 # Control whether to attach interactively or run headless (CI/local script)
 AUTO_ATTACH="${AUTO_ATTACH:-1}"
+RUN_TESTS="${RUN_TESTS:-1}"
 
 info() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 warn() { printf '[%s] WARNING: %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
@@ -223,28 +224,31 @@ cmd_start() {
     warn "Unable to send test command to PTY; continuing anyway."
   fi
 
-  # 4: Run sanity checks
-  info "Running system sanity checks..."
-  send_to_console "$PTY" "echo '=== System Information ==='\n"
-  sleep 1
-  
-  send_to_console "$PTY" "echo '--- Kernel Version ---'\n"
-  send_to_console "$PTY" "uname -a\n"
-  sleep 1
-  
-  send_to_console "$PTY" "echo '--- CPU Information ---'\n"
-  send_to_console "$PTY" "head -n 20 /proc/cpuinfo\n"
-  sleep 1
-  
-  send_to_console "$PTY" "echo '--- Memory Information ---'\n"
-  send_to_console "$PTY" "free -h\n"
-  sleep 1
-  
-  send_to_console "$PTY" "echo '--- Disk Usage ---'\n"
-  send_to_console "$PTY" "df -h /\n"
-  sleep 1
+  if [[ "$RUN_TESTS" == "0" ]]; then
+    info "Headless mode: Skipping further interactive checks."
+  else 
+    info "Running system sanity checks..."
+    send_to_console "$PTY" "echo '=== System Information ==='\n"
+    sleep 1
+    
+    send_to_console "$PTY" "echo '--- Kernel Version ---'\n"
+    send_to_console "$PTY" "uname -a\n"
+    sleep 1
+    
+    send_to_console "$PTY" "echo '--- CPU Information ---'\n"
+    send_to_console "$PTY" "head -n 20 /proc/cpuinfo\n"
+    sleep 1
+    
+    send_to_console "$PTY" "echo '--- Memory Information ---'\n"
+    send_to_console "$PTY" "free -h\n"
+    sleep 1
+    
+    send_to_console "$PTY" "echo '--- Disk Usage ---'\n"
+    send_to_console "$PTY" "df -h /\n"
+    sleep 1
 
-  send_to_console "$PTY" "echo '=== Sanity Checks Complete ==='\n"
+    send_to_console "$PTY" "echo '=== Sanity Checks Complete ==='\n"
+  fi
   
   # Give output time to appear
   sleep 2

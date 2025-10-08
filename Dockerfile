@@ -42,9 +42,7 @@ FROM ubuntu:24.04
 
 # Metadata
 LABEL maintainer="Cloud-V Team"
-LABEL description="QEMU RISC-V64 Ubuntu VM for testing"
-LABEL version="1.0"
-
+LABEL description="QEMU System RISC-V64 Ubuntu VM for testing"
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=UTC
@@ -58,46 +56,17 @@ ENV BOOT_TIMEOUT=300
 #TODO : Build from source for latest version
 RUN apt-get update && apt-get install -y \
     # QEMU and RISC-V support
-    qemu-system-riscv64 \        
-    opensbi \
-    u-boot-qemu \                
-    qemu-efi-riscv64 \
-    qemu-utils \
-    # System utilities
-    curl \
-    wget \
-    socat \
-    netcat-traditional \
-    iproute2 \
-    iputils-ping \
-    # Non-interactive SSH password helper for CI-mode
-    sshpass \
+    qemu-system-riscv64 opensbi u-boot-qemu qemu-utils \
+    # System utilities 
+    curl wget socat netcat-traditional iproute2 iputils-ping \
     # Development tools
-    build-essential \
-    git \
-    vim \
-    nano \
-    tmux \
-    screen \
-    # Monitoring and debugging
-    htop \
-    strace \
-    gdb \
+    build-essential git vim nano tmux screen \
     # Cloud-init tools
-    cloud-init \
-    cloud-utils \
+    cloud-init cloud-utils \
     # Networking tools
-    openssh-client \
-    rsync \
+    openssh-client rsync \
     # File utilities
-    unzip \
-    zip \
-    tree \
-    jq \
-    # Process management
-    supervisor \
-    # Math utilities
-    bc \
+    unzip zip tree jq \
     && rm -rf /var/lib/apt/lists/*
 
 
@@ -110,7 +79,6 @@ RUN mkdir -p /opt/riscv-vm \
 
 # Copy Ubuntu RISC-V image from builder stage
 COPY --from=builder --chown=ubuntu:ubuntu --chmod=0644 /build/ubuntu-riscv64.qcow2 /opt/riscv-vm/
-ENV VM_IMAGE="/opt/riscv-vm/ubuntu-riscv64.qcow2"
 
 # Extract the image in the final location
 RUN cd /opt/riscv-vm && ls -lh /opt/riscv-vm/
@@ -122,9 +90,6 @@ COPY cloud-init/ /opt/cloud-init/
 RUN chmod +x /opt/scripts/*.sh /opt/cloud-init/*.sh
 RUN /opt/cloud-init/create-seed.sh
 
-# # Set up proper permissions
-# RUN chown -R ubuntu:ubuntu /opt/riscv-vm \
-#     && chmod 644 /opt/riscv-vm/ubuntu-riscv64.img
 
 # Expose ports that might be forwarded from RISC-V VM
 EXPOSE 22 80 443 8080 3000 5000

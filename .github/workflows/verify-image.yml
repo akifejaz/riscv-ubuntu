@@ -10,337 +10,211 @@ on:
 jobs:
   test-riscv-qemu:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
 
     env:
       CONTAINER_NAME: riscv-test
       LOG_DIR: ${{ github.workspace }}/var/log/qemu
-      WORK_DIR: ${{ github.workspace }}/workspace
       CONSOLE_LOG: ${{ github.workspace }}/var/log/qemu/console.log
       GUEST_FIFO: /var/log/qemu/guest.in
-      STREAM_TIMEOUT_SECONDS: "180"
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Prepare directories & permissions
+      - name: Prepare directories
         run: |
           set -euo pipefail
-          mkdir -p "${LOG_DIR}" "${WORK_DIR}"
-          chmod 755 "${LOG_DIR}" "${WORK_DIR}"
-          # Ensure the interactive wrapper is executable
-          chmod +x scripts/shell.sh
+          mkdir -p "${LOG_DIR}"
+          chmod 755 "${LOG_DIR}"
 
-      - name: Pull RISC-V QEMU Ubuntu image
+      - name: Pull RISC-V QEMU image
         run: |
           set -euo pipefail
           docker pull cloudv10x/riscv-qemu-ubuntu:latest
-          docker images cloudv10x/riscv-qemu-ubuntu:latest
 
-      - name: Start RISC-V QEMU container (headless)
+      - name: Start RISC-V QEMU container
         id: start-container
         run: |
           set -euo pipefail
-          CONTAINER_ID=$(docker run -d \
+          docker run -d \
             --name "${CONTAINER_NAME}" \
             --privileged \
-            -v "${WORK_DIR}":/workspace \
             -v "${LOG_DIR}":/var/log/qemu \
             -e AUTO_ATTACH=0 \
-            cloudv10x/riscv-qemu-ubuntu:latest)
-          echo "container_id=$CONTAINER_ID" >> "$GITHUB_OUTPUT"
-          docker ps --filter "name=${CONTAINER_NAME}"
-
-      - name: Wait for QEMU boot completion
-        timeout-minutes: 15
-        run: |
-          set -euo pipefail
-          echo "Waiting for QEMU to boot completely..."
-
-          READY_PATTERNS=(
-            "System is ready for headless operation"
-            "RISC-V Ubuntu image is ready"
-          )
-
-          # Up to 15 minutes (180 * 5s)
-          for i in $(seq 1 180); do
-            if ! docker ps --format '{{.Names}}' | grep -qx "${CONTAINER_NAME}"; then
-              echo "ERROR: Container exited early!"
-              docker logs "${CONTAINER_NAME}" || true
-              exit 1
-            fi
-
-            LOGS="$(docker logs "${CONTAINER_NAME}" 2>&1 | tail -n 500 || true)"
-            for pat in "${READY_PATTERNS[@]}"; do
-              if echo "${LOGS}" | grep -q "${pat}"; then
-                echo "✓ Boot completed: '${pat}'"
-                FOUND=1
-                break
-              fi
-            done
-            [ "${FOUND:-0}" = "1" ] && break
-
-            if [ "$i" -eq 180 ]; then
-              echo "ERROR: Boot timeout - system not ready after 15 minutes"
-              echo "=== Container Logs (tail) ==="
-              echo "${LOGS}"
-              exit 1
-            fi
-
-            if [ $((i % 10)) -eq 0 ]; then
-              echo "Still waiting... ($i/180 checks, ~$((i*5)) seconds elapsed)"
-            fi
-            sleep 5
-          done
-
-          echo "=== Boot Summary (last 40 lines) ==="
-          docker logs "${CONTAINER_NAME}" --tail 40 2>&1 || true
-
-      - name: Verify headless interface
-        run: |
-          set -euo pipefail
-          echo "Verifying headless interface components..."
-
-          # Must have PTY path
-          docker exec "${CONTAINER_NAME}" test -f /var/log/qemu/pty.path || { echo "ERROR: PTY path file not found"; exit 1; }
-          PTY_PATH="$(docker exec "${CONTAINER_NAME}" cat /var/log/qemu/pty.path)"
-          echo "Guest PTY: ${PTY_PATH}"
-          echo "GUEST_PTY=${PTY_PATH}" >> $GITHUB_ENV
-
-          # Ensure console.log exists (host-mounted)
-          docker exec "${CONTAINER_NAME}" test -f /var/log/qemu/console.log || { echo "ERROR: console.log missing"; exit 1; }
-
-          # Ensure FIFO exists; if missing, create it
-          if ! docker exec "${CONTAINER_NAME}" test -p /var/log/qemu/guest.in; then
-            echo "guest.in FIFO missing — creating..."
-            docker exec "${CONTAINER_NAME}" bash -lc '
-              set -euo pipefail
-              mkdir -p /var/log/qemu
-              [ -p /var/log/qemu/guest.in ] || mkfifo /var/log/qemu/guest.in
-              chmod 666 /var/log/qemu/guest.in || true
-            '
-            echo "✓ FIFO created"
-          else
-            echo "✓ guest.in FIFO present"
-          fi
-
-          # List QEMU directory contents
-          echo "=== QEMU directory contents ==="
-          docker exec "${CONTAINER_NAME}" ls -la /var/log/qemu/
-
-          # Start FIFO bridge if not running
-          echo "=== Starting FIFO -> PTY bridge ==="
-          docker exec -d "${CONTAINER_NAME}" bash -c '
-            PTY="$(cat /var/log/qemu/pty.path)"
-            exec >/var/log/qemu/guest-bridge.log 2>&1
-            echo "Bridge starting at $(date)"
-            echo "PTY: ${PTY}"
-            echo "FIFO: /var/log/qemu/guest.in"
-            
-            # This will block reading from FIFO until data arrives
-            while true; do
-              if [ -p /var/log/qemu/guest.in ] && [ -c "${PTY}" ]; then
-                cat /var/log/qemu/guest.in > "${PTY}" || {
-                  echo "Bridge cat failed, restarting in 1s..."
-                  sleep 1
-                }
-              else
-                echo "FIFO or PTY missing, waiting..."
-                sleep 1
-              fi
-            done
-          '
+            -e RUN_TESTS=0 \
+            cloudv10x/riscv-qemu-ubuntu:latest
           
-          sleep 2
-          
-          echo "=== Checking bridge status ==="
-          docker exec "${CONTAINER_NAME}" bash -c '
-            if pgrep -f "cat /var/log/qemu/guest.in" >/dev/null; then
-              echo "✓ Bridge process is running"
-              pgrep -af "cat /var/log/qemu/guest.in"
-            else
-              echo "WARNING: Bridge process not found"
-            fi
-          '
-          
-          echo "=== Bridge log ==="
-          docker exec "${CONTAINER_NAME}" cat /var/log/qemu/guest-bridge.log 2>/dev/null || echo "(no bridge log yet)"
+          echo "Container started: ${CONTAINER_NAME}"
 
-      - name: Setup workspace in guest VM
-        run: |
-          set -euo pipefail
-          
-          send_to_guest() {
-            local text="$1"
-            docker exec "${CONTAINER_NAME}" bash -c "printf '%s\n' \"${text}\" > '${GUEST_FIFO}'"
-          }
-          
-          echo "=== Testing FIFO/PTY bridge ==="
-          PROBE="__BRIDGE_TEST__$(date +%s)"
-          echo "Sending probe: ${PROBE}"
-          send_to_guest "echo ${PROBE}"
-          sleep 2
-          
-          if docker exec "${CONTAINER_NAME}" grep -q "${PROBE}" /var/log/qemu/console.log; then
-            echo "✓ Bridge is working"
-          else
-            echo "✗ Bridge test failed"
-            exit 1
-          fi
-          
-          echo ""
-          echo "=== Creating workspace directory in guest ==="
-          send_to_guest "sudo mkdir -p /workspace"
-          sleep 1
-          send_to_guest "sudo chmod 777 /workspace"
-          sleep 1
-          send_to_guest "ls -la /workspace"
-          sleep 2
-          
-          echo "✓ Workspace setup complete"
-
-      - name: Run sanity suite with marker-based streaming
+      - name: Wait for QEMU boot
         timeout-minutes: 10
         run: |
           set -euo pipefail
+          echo "Waiting for QEMU boot completion..."
 
-          # Define helper functions
-          send_byte_to_guest() {
-            local -i code="$1"
-            docker exec "${CONTAINER_NAME}" bash -c "printf '\\x%02x' ${code} > '${GUEST_FIFO}'"
-          }
+          for i in $(seq 1 120); do
+            if ! docker ps --format '{{.Names}}' | grep -qx "${CONTAINER_NAME}"; then
+              echo "ERROR: Container stopped unexpectedly"
+              docker logs "${CONTAINER_NAME}" --tail 100 || true
+              exit 1
+            fi
 
-          send_to_guest() {
-            local text="$1"
-            docker exec "${CONTAINER_NAME}" bash -c "printf '%s\n' \"${text}\" > '${GUEST_FIFO}'"
-          }
+            # Grab a generous tail and strip CRs/ANSI noise just in case
+            LOGS="$(docker logs "${CONTAINER_NAME}" 2>&1 | tail -n 200 | tr -d '\r')"
 
-          run_cmd_stream() {
-            local cmd="$1"
-            local timeout="${2:-45}"
-            
-            echo ">>> ${cmd}"
-            
-            local uid
-            uid="$(date +%s%N)-$RANDOM"
-            local START="__HOST_START__${uid}__"
-            local END="__HOST_END__${uid}__"
-            
-            local inject="{ echo ${START}; { ${cmd}; rc=\$?; }; printf '${END} EXIT=%d\n' \"\${rc}\"; } 2>&1"
-            
-            timeout ${timeout}s stdbuf -oL -eL tail -n0 -F "${CONSOLE_LOG}" 2>/dev/null \
-              | awk -v start="${START}" -v end="${END}" '
-                  BEGIN { started=0 }
-                  {
-                    if (!started) {
-                      if (index($0, start)) { started=1; next }
-                      next
-                    } else {
-                      if (index($0, end)) {
-                        exitidx = index($0, "EXIT=");
-                        if (exitidx > 0) {
-                          code = substr($0, exitidx+5);
-                          printf("[exit %s]\n", code);
-                        }
-                        exit 0
-                      }
-                      print
-                    }
-                  }
-                ' &
-            local awk_pid=$!
-            
-            trap 'send_byte_to_guest 3 >/dev/null 2>&1 || true; kill -TERM '"$awk_pid"' >/dev/null 2>&1 || true' INT
-            
-            sleep 0.5
-            send_to_guest "${inject}"
-            
-            wait "${awk_pid}" 2>/dev/null || true
-            trap - INT
-          }
+            # Accept either our explicit sentinel, or the interactive SHELL_READY as a backup
+            if tail -n 50 "${CONSOLE_LOG}" | grep -qE "RISC-V Ubuntu image is ready."; then
+              echo "✓ System ready (cloud-init sentinel seen)"
+              exit 0
+            fi
+            if echo "${LOGS}" | grep -qE "System is ready for headless operation"; then
+              echo "✓ System ready (shell sentinel seen)"
+              exit 0
+            fi
 
-          # Run test commands
-          echo "=== System Information Tests ==="
-          run_cmd_stream "uname -a"
-          run_cmd_stream "whoami"
-          run_cmd_stream "pwd"
+            # Progress ping
+            if [ $((i % 20)) -eq 0 ]; then
+              echo "Still booting... ($((i*5))s elapsed)"
+            fi
+
+            sleep 5
+          done
+
+          echo "ERROR: Boot timeout after 10 minutes"
+          echo "=== Last 200 log lines ==="
+          docker logs "${CONTAINER_NAME}" --tail 200 || true
+          exit 1
           
-          echo ""
-          echo "=== System Configuration ==="
-          run_cmd_stream "cat /etc/os-release | head -3"
-          run_cmd_stream "lscpu | head -10"
-          run_cmd_stream "free -h"
-          run_cmd_stream "df -h /"
-          
-          echo ""
-          echo "=== Workspace Tests ==="
-          run_cmd_stream "ls -ld /workspace"
-          run_cmd_stream "echo 'GitHub Actions Test - \$(date)' | tee /workspace/test_output.txt"
-          run_cmd_stream "cat /workspace/test_output.txt"
-          
-          echo ""
-          echo "✓ All sanity tests completed"
-
-      - name: Verify test results on host
+      - name: Setup headless interface
         run: |
           set -euo pipefail
-          echo "=== Verifying Test Results ==="
           
-          # The workspace is inside the guest VM, not mounted to host
-          # We need to check it via docker exec into the guest
-          echo "Checking if test file exists in guest VM..."
+          # Verify PTY exists
+          docker exec "${CONTAINER_NAME}" test -f /var/log/qemu/pty.path || {
+            echo "ERROR: PTY path not found"
+            exit 1
+          }
           
-          if docker exec "${CONTAINER_NAME}" test -f /workspace/test_output.txt 2>/dev/null; then
-            echo "✓ Workspace file exists in guest VM"
-            echo "Contents:"
-            docker exec "${CONTAINER_NAME}" cat /workspace/test_output.txt
+          PTY_PATH="$(docker exec "${CONTAINER_NAME}" cat /var/log/qemu/pty.path)"
+          echo "Guest PTY: ${PTY_PATH}"
+          
+          # Create FIFO if missing
+          docker exec "${CONTAINER_NAME}" bash -c '
+            [ -p /var/log/qemu/guest.in ] || mkfifo /var/log/qemu/guest.in
+            chmod 666 /var/log/qemu/guest.in
+          '
+          
+          # Start FIFO->PTY bridge
+          docker exec -d "${CONTAINER_NAME}" bash -c '
+            PTY="$(cat /var/log/qemu/pty.path)"
+            while true; do
+              [ -p /var/log/qemu/guest.in ] && [ -c "${PTY}" ] && \
+                cat /var/log/qemu/guest.in > "${PTY}" || sleep 1
+            done
+          ' 2>/dev/null
+          
+          sleep 2
+          
+          # Verify bridge is running
+          docker exec "${CONTAINER_NAME}" pgrep -f "cat /var/log/qemu/guest.in" >/dev/null || {
+            echo "WARNING: Bridge process not detected"
+          }
+          
+      - name: Test bridge connection
+        run: |
+          set -euo pipefail
+          
+          send_cmd() {
+            docker exec "${CONTAINER_NAME}" bash -c "printf '%s\n' \"$1\" > '${GUEST_FIFO}'"
+          }
+          
+          PROBE="__TEST_$(date +%s)__"
+          send_cmd "echo ${PROBE}"
+          sleep 2
+          
+          if docker exec "${CONTAINER_NAME}" grep -q "${PROBE}" /var/log/qemu/console.log; then
+            echo "✓ Bridge operational"
           else
-            echo "Note: /workspace exists only inside the QEMU guest VM"
-            echo "The host-mounted ${WORK_DIR} is separate from guest /workspace"
-            echo ""
-            echo "To share files between host and guest, copy them:"
-            echo "  Guest -> Container: Copy from guest /workspace to container /var/log/qemu or other mounted path"
-            echo "  Container -> Host: Files in container mounted paths appear on host"
+            echo "ERROR: Bridge test failed"
+            exit 1
           fi
 
-      - name: Display final console output
-        if: always()
+      - name: Run system tests
+        timeout-minutes: 5
         run: |
-          echo "=== Final Console Output (last 120 lines) ==="
-          docker exec "${CONTAINER_NAME}" tail -n 120 /var/log/qemu/console.log 2>/dev/null || echo "Console log not accessible"
+          set -euo pipefail
+          send_cmd() {
+            docker exec "${CONTAINER_NAME}" bash -c "printf '%s\n' \"$1\" > '${GUEST_FIFO}'"
+          }
+          run_test() {
+            local cmd="$1"
+            local timeout="${2:-30}"
+            
+            echo "→ ${cmd}"
+            
+            local uid="$(date +%s%N)-$RANDOM"
+            local START="__START_${uid}__"
+            local END="__END_${uid}__"
+            
+            local wrapped="{ echo ${START}; ${cmd}; echo ${END}; } 2>&1"
+            
+            timeout ${timeout}s tail -n0 -F "${CONSOLE_LOG}" 2>/dev/null | \
+              awk -v s="${START}" -v e="${END}" '
+                BEGIN { active=0 }
+                { 
+                  if (index($0, s)) { active=1; next }
+                  if (index($0, e)) { exit 0 }
+                  if (active) print
+                }
+              ' &
+            local awk_pid=$!
+            
+            sleep 0.3
+            send_cmd "${wrapped}"
+            
+            wait "${awk_pid}" 2>/dev/null || true
+            echo ""
+          }
+          
+          echo "=== System Information ==="
+          run_test "uname -a"
+          run_test "whoami"
+          run_test "cat /etc/os-release | grep -E '^(NAME|VERSION_ID)='"
+          
+          echo "=== Hardware Info ==="
+          run_test "nproc"
+          run_test "free -h | grep Mem"
+          run_test "df -h / | tail -1"
+          
+          echo "=== Workspace Test ==="
+          run_test "mkdir -p /tmp/test && echo 'GitHub Actions Test' > /tmp/test/output.txt"
+          run_test "cat /tmp/test/output.txt"
+          
+          echo "✓ All tests completed"
 
-      - name: Logs and diagnostics
-        if: always()
+      - name: Capture diagnostics
+        if: failure()
         run: |
-          echo "=== Container Status ==="
+          echo "=== Failure Diagnostics ==="
+          echo "Container status:"
           docker ps -a --filter "name=${CONTAINER_NAME}"
+          
+          echo -e "\n=== Last 100 console lines ==="
+          docker exec "${CONTAINER_NAME}" tail -n 100 /var/log/qemu/console.log 2>/dev/null || \
+            echo "Console log unavailable"
+          
+          echo -e "\n=== Container logs ==="
+          docker logs --tail 50 "${CONTAINER_NAME}" 2>&1 || echo "Container logs unavailable"
 
-          echo ""
-          echo "=== Mounted Workspace ==="
-          ls -la "${WORK_DIR}" || echo "Workspace not found"
-
-          echo ""
-          echo "=== Mounted Log Directory ==="
-          ls -la "${LOG_DIR}" || echo "Log directory not found"
-
-          echo ""
-          echo "=== Container Boot Log (last 60 lines) ==="
-          docker logs --tail 60 "${CONTAINER_NAME}" 2>&1 || echo "Could not get container logs"
-
-          echo ""
-          echo "=== QEMU Boot Log (last 40 lines) ==="
-          docker exec "${CONTAINER_NAME}" tail -n 40 /var/log/qemu/qemu.boot.log 2>/dev/null || echo "Boot log not accessible"
-
-      - name: Upload logs and artifacts
+      - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: riscv-qemu-logs
-          path: |
-            ${{ github.workspace }}/var/log/qemu/
-            ${{ github.workspace }}/workspace/
-          retention-days: 7
+          path: ${{ github.workspace }}/var/log/qemu/
+          retention-days: 3
+          if-no-files-found: warn
 
       - name: Cleanup
         if: always()
