@@ -21,7 +21,10 @@ jobs:
   qemu-system-riscv64-ubuntu:
     runs-on: ubuntu-latest
 
-    # Job-level env (used by steps; NOT by container.options)
+    defaults:
+      run:
+        shell: bash
+
     env:
       CONTAINER_NAME: riscv-test
       WORK_DIR: ${{ github.workspace }}
@@ -31,7 +34,6 @@ jobs:
 
     container:
       image: cloudv10x/riscv-qemu-ubuntu:latest
-      # container.options is resolved before env; use github.* only or literals
       options: >-
         --name riscv-test
         --privileged
