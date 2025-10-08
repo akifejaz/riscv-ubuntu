@@ -57,31 +57,26 @@ wait_for_qemu_boot() {
   echo "Waiting for QEMU boot completion (timeout=${timeout}s, interval=${interval}s)..."
 
   while (( i <= attempts )); do
-    # 1) Container still running?
-    if ! docker ps --format '{{.Names}}' | grep -qx "${container_name}"; then
-      echo "ERROR: Container stopped unexpectedly: ${container_name}"
-      docker logs "${container_name}" --tail 100 || true
-      return 1
-    fi
-
-    # 2) Console log signals (preferred)
+    # 1) Preferred: console log signals (inside container)
     if [[ -n "${console_log}" && -f "${console_log}" ]]; then
-      if tail -n 100 "${console_log}" | tr -d '\r' | grep -qE 'RISC-V Ubuntu image is ready\.|System is ready for headless operation'; then
+      if tail -n 200 "${console_log}" 2>/dev/null | tr -d '\r' | \
+         grep -qE 'Cloud-init finished|RISC-V Ubuntu image is ready\.|System is ready for headless operation|ubuntu@riscv-ubuntu.*\$'
+      then
         echo "System ready (matched in console log)"
         return 0
       fi
     fi
 
-    # 3) Fallback: container logs
-    if docker logs "${container_name}" 2>&1 | tail -n 200 | tr -d '\r' | \
-       grep -qE 'RISC-V Ubuntu image is ready\.|System is ready for headless operation'; then
-      echo "System ready (matched in container logs)"
-      return 0
+    # 2) Best-effort hint: QEMU process existence (does not guarantee readiness)
+    if pgrep -fa 'qemu-system-riscv64' >/dev/null 2>&1; then
+      : # process seen; still wait for log markers to be robust
     fi
 
     # Progress every ~100s
     if (( i % progress_every == 0 )); then
       echo "  Still booting... $(( i * interval ))s elapsed"
+      # Show a short tail to aid debugging without being noisy
+      [[ -n "${console_log}" && -f "${console_log}" ]] && tail -n 20 "${console_log}" 2>/dev/null || true
     fi
 
     sleep "${interval}"
@@ -89,8 +84,12 @@ wait_for_qemu_boot() {
   done
 
   echo "ERROR: Boot timeout after ${timeout}s"
-  echo "=== Last 200 docker log lines ==="
-  docker logs "${container_name}" --tail 200 || true
+  if [[ -n "${console_log}" && -f "${console_log}" ]]; then
+    echo "=== Last 200 console log lines (${console_log}) ==="
+    tail -n 200 "${console_log}" || true
+  else
+    echo "Console log not found or not provided; cannot show last lines."
+  fi
   return 1
 }
 
